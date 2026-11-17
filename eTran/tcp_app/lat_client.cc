@@ -141,6 +141,10 @@ void thread_func(unsigned int tid)
 
     char recv_buf[data_bytes];
     char send_buf[data_bytes]; 
+    struct timeval measurement_start;
+    gettimeofday(&measurement_start, NULL);
+    printf("measurement_start_unix_us: %llu\n",
+           (unsigned long long)measurement_start.tv_sec * 1000000 + measurement_start.tv_usec);
     // struct eTrantcp_event events[256] = {};
     // struct app_ctx_per_thread *tctx = eTran_get_tctx();
     // bool outstanding = false;
@@ -197,6 +201,10 @@ void thread_func(unsigned int tid)
         // }
     }
 out:
+    struct timeval measurement_end;
+    gettimeofday(&measurement_end, NULL);
+    printf("measurement_end_unix_us: %llu\n",
+           (unsigned long long)measurement_end.tv_sec * 1000000 + measurement_end.tv_usec);
 
     /* dump rtts */
     for (auto it1 = recv_tsc.begin(), it2 = send_tsc.begin(); it1 != recv_tsc.end() && it2 != send_tsc.end(); it1++, it2++) {

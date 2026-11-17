@@ -164,7 +164,7 @@ int eTranNIC::create_nic(void)
     if (_intr_affinity)
     {
         /* disable irqbalance */
-        cmd = "killall irqbalance > /dev/null 2>&1";
+        cmd = "if pgrep -x irqbalance > /dev/null; then killall irqbalance; fi";
         if (!exec_cmd(cmd))
         {
             fprintf(stderr, "Failed to kill irqbalance\n");

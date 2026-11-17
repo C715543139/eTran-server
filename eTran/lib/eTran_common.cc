@@ -402,6 +402,19 @@ extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, voi
         assert(0);
     }
 
+    const char *fixed_cpu = std::getenv("ETRAN_APP_CPU");
+    if (fixed_cpu) {
+        char *end = nullptr;
+        errno = 0;
+        long cpu = strtol(fixed_cpu, &end, 10);
+        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= CPU_SETSIZE || cpu >= sysconf(_SC_NPROCESSORS_ONLN)) {
+            fprintf(stderr, "Invalid application CPU: %s\n", fixed_cpu);
+            exit(EXIT_FAILURE);
+        }
+        CPU_ZERO(&cpuSet);
+        CPU_SET(cpu, &cpuSet);
+    }
+
     pthread_attr_t local_attr;
     const pthread_attr_t* use_attr = attr;
     bool created_attr = false;

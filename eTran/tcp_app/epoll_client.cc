@@ -31,6 +31,7 @@ unsigned int nr_flows = 1;
 unsigned int nr_threads = 1;
 unsigned int nr_queues = 1;
 unsigned int message_bytes = 100;
+unsigned int send_interval_us = 2000;
 std::string server_ip_str = "192.168.6.2";
 uint16_t server_port = 50000;
 
@@ -90,7 +91,9 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             break;
         }
     }
-    usleep(2000);
+    if (send_interval_us) {
+        usleep(send_interval_us);
+    }
     return need_epoll_out;
 }
 
@@ -258,7 +261,7 @@ void thread_func(unsigned int tid)
 int parse_args(int argc, char *argv[])
 {
     int opt;
-    while ((opt = getopt(argc, argv, "t:q:f:b:i:p:so:mw:l:D")) != -1) {
+    while ((opt = getopt(argc, argv, "t:q:f:b:i:p:so:mw:l:Du:")) != -1) {
         switch (opt) {
             case 'b':
                 message_bytes = std::stoi(optarg);
@@ -299,6 +302,15 @@ int parse_args(int argc, char *argv[])
             case 'o':
                 max_outstanding = std::stoi(optarg);
                 break;
+            case 'u': {
+                int interval = std::stoi(optarg);
+                if (interval < 0) {
+                    std::cerr << "Send interval must be non-negative" << std::endl;
+                    return -1;
+                }
+                send_interval_us = interval;
+                break;
+            }
             default:
                 std::cout << "Usage: " << argv[0] << 
                     " [-t nr_threads, default:1]" <<
@@ -311,6 +323,7 @@ int parse_args(int argc, char *argv[])
                     " [-w wait_seconds, default:0]" <<
                     " [-s enable short_response, default:true]" << 
                     " [-o max_outstanding, default:1]" <<
+                    " [-u send_interval_us, default:2000]" <<
                     " [-m multiport, default:false]" << 
                     " [-D dummy, default:false]" <<
                     " [-d dump_io_stats]" << std::endl;

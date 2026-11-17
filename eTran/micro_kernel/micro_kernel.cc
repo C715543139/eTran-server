@@ -78,7 +78,7 @@ static int system_init(void)
     std::string cmd;
 
     /* configure hugepages */
-    cmd = "mount -t hugetlbfs nodev /dev/hugepages";
+    cmd = "mountpoint -q /dev/hugepages || mount -t hugetlbfs nodev /dev/hugepages";
     if (!exec_cmd(cmd))
     {
         fprintf(stderr, "Failed to mount hugepages\n");
@@ -191,7 +191,8 @@ static void run_monitor(void)
     while (!force_quit)
     {
         sleep(1);
-        std::getline(std::cin, command);
+        if (!std::getline(std::cin, command))
+            break;
         if (command == "exit")
         {
             shutdown_monitor();

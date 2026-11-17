@@ -465,6 +465,28 @@ int getCoreRoundRobin(std::vector<int> *candidate, int *nxtIdx, int threshold, i
 }
 
 int getCore(int type) {
+    const char *fixed_cpu = std::getenv(type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
+    if (fixed_cpu) {
+        char *end = nullptr;
+        errno = 0;
+        long cpu = strtol(fixed_cpu, &end, 10);
+        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || cpu == CP_CPU) {
+            fprintf(stderr, "Invalid fixed CPU: %s\n", fixed_cpu);
+            exit(EXIT_FAILURE);
+        }
+        availableCores.erase(cpu);
+        if (type == LATENCY) {
+            throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
+            if (std::find(latUsingCores.begin(), latUsingCores.end(), cpu) == latUsingCores.end()) {
+                latUsingCores.push_back(cpu);
+            }
+            cpuLatUseRef[cpu]++;
+        } else if (cpuLatUseRef[cpu] == 0 && std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
+            throughputUsingCores.push_back(cpu);
+        }
+        cpuUseRef[cpu]++;
+        return cpu;
+    }
     //从nxtIdx开始寻找第一个负载低于thresh的，如果没有则额外生成一个CPU，并重置nxtIdx
     //如果是lat的话搜寻次序依次为latUsingCores, throughputUsingCores, availableCores;
     //如果是throughput的话为throughputUsingCores, availableCores
@@ -841,6 +863,9 @@ static void free_app_resources(struct app_ctx *actx)
 
 static void destroy_all_apps(void)
 {
+    if (active_apps.apps.empty()) {
+        return;
+    }
     // Notify all apps to exit
     for (auto it = active_apps.apps.begin(); it != active_apps.apps.end(); it++)
     {

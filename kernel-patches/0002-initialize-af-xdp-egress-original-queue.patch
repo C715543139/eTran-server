@@ -1,0 +1,8 @@
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -209,4 +209,5 @@ int xp_assign_dev(struct xsk_buff_pool *pool,
+     pool->rxq.dev = pool->netdev;
+     pool->rxq.queue_index = pool->queue_id;
++    pool->rxq.orig_queue_index = U32_MAX;
+     pool->rxq.mem.type = MEM_TYPE_XSK_BUFF_POOL;
+     pool->txq.dev = pool->netdev;
