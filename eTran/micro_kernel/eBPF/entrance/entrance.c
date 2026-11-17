@@ -14,31 +14,35 @@
 #define TCP_TRAN_XDP_IDX 0
 #define HOMA_TRAN_XDP_IDX 1
 
-/* XDP and CPUMAP selects the transport based on packet header while 
+/* XDP and CPUMAP selects the transport based on packet header while
  * XDP_GEN and XDP_EGRESS selects the transport based on the umem_id
-*/
-struct {
+ */
+struct
+{
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, MAX_TRANSPORTS);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } tran_xdp_map SEC(".maps");
 
-struct {
+struct
+{
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, MAX_UMEM_ID);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } umem_id_tran_map SEC(".maps");
 
-struct {
+struct
+{
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, MAX_TRANSPORTS);
     __uint(key_size, sizeof(int));
     __uint(value_size, sizeof(int));
 } tran_xdp_gen_map SEC(".maps");
 
-struct {
+struct
+{
     __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
     __uint(max_entries, MAX_TRANSPORTS);
     __uint(key_size, sizeof(int));
@@ -53,7 +57,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
     struct iphdr *iph;
     void *data, *data_end;
     int proto_type;
-    
+
     data = (void *)(long)ctx->data;
     data_end = (void *)(long)ctx->data_end;
     nh.pos = data;
@@ -67,16 +71,17 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     /* check IP header */
     proto_type = parse_iphdr(&nh, data_end, &iph);
-    
-    switch (proto_type) {
-        case IPPROTO_TCP:
-            bpf_tail_call(ctx, &tran_xdp_map, TCP_TRAN_XDP_IDX);
-            break;
-        case IPPROTO_HOMA:
-            bpf_tail_call(ctx, &tran_xdp_map, HOMA_TRAN_XDP_IDX);
-            break;
-        default:
-            return XDP_PASS;
+
+    switch (proto_type)
+    {
+    case IPPROTO_TCP:
+        bpf_tail_call(ctx, &tran_xdp_map, TCP_TRAN_XDP_IDX);
+        break;
+    case IPPROTO_HOMA:
+        bpf_tail_call(ctx, &tran_xdp_map, HOMA_TRAN_XDP_IDX);
+        break;
+    default:
+        return XDP_PASS;
     }
     return XDP_PASS;
 }

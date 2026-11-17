@@ -13,6 +13,7 @@ compile_commands.json
 lib/libbpf-install/
 llvm.sh
 bpftool/
+experiments/
 
 # Ignore all executables
 bench-afxdp/xdpsock

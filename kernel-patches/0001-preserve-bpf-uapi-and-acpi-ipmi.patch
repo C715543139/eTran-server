@@ -1,0 +1,136 @@
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -963,8 +963,6 @@
+ 	BPF_PROG_TYPE_SCHED_ACT,
+ 	BPF_PROG_TYPE_TRACEPOINT,
+ 	BPF_PROG_TYPE_XDP,
+-	BPF_PROG_TYPE_XDP_EGRESS,
+-	BPF_PROG_TYPE_XDP_GEN,
+ 	BPF_PROG_TYPE_PERF_EVENT,
+ 	BPF_PROG_TYPE_CGROUP_SKB,
+ 	BPF_PROG_TYPE_CGROUP_SOCK,
+@@ -991,6 +989,9 @@
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ 	BPF_PROG_TYPE_NETFILTER,
++	/* eTran extensions keep existing UAPI values stable. */
++	BPF_PROG_TYPE_XDP_EGRESS = 33,
++	BPF_PROG_TYPE_XDP_GEN = 34,
+ };
+ 
+ enum bpf_attach_type {
+@@ -1032,8 +1033,6 @@
+ 	BPF_XDP_CPUMAP,
+ 	BPF_SK_LOOKUP,
+ 	BPF_XDP,
+-	BPF_XDP_EGRESS,
+-	BPF_XDP_GEN,
+ 	BPF_SK_SKB_VERDICT,
+ 	BPF_SK_REUSEPORT_SELECT,
+ 	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE,
+@@ -1045,6 +1044,9 @@
+ 	BPF_TCX_INGRESS,
+ 	BPF_TCX_EGRESS,
+ 	BPF_TRACE_UPROBE_MULTI,
++	/* eTran extensions keep existing UAPI values stable. */
++	BPF_XDP_EGRESS = 56,
++	BPF_XDP_GEN = 57,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -963,8 +963,6 @@
+ 	BPF_PROG_TYPE_SCHED_ACT,
+ 	BPF_PROG_TYPE_TRACEPOINT,
+ 	BPF_PROG_TYPE_XDP,
+-    BPF_PROG_TYPE_XDP_EGRESS,
+-    BPF_PROG_TYPE_XDP_GEN,
+ 	BPF_PROG_TYPE_PERF_EVENT,
+ 	BPF_PROG_TYPE_CGROUP_SKB,
+ 	BPF_PROG_TYPE_CGROUP_SOCK,
+@@ -991,6 +989,9 @@
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ 	BPF_PROG_TYPE_NETFILTER,
++	/* eTran extensions keep existing UAPI values stable. */
++	BPF_PROG_TYPE_XDP_EGRESS = 33,
++	BPF_PROG_TYPE_XDP_GEN = 34,
+ };
+ 
+ enum bpf_attach_type {
+@@ -1043,6 +1044,9 @@
+ 	BPF_TCX_INGRESS,
+ 	BPF_TCX_EGRESS,
+ 	BPF_TRACE_UPROBE_MULTI,
++	/* eTran extensions keep existing UAPI values stable. */
++	BPF_XDP_EGRESS = 56,
++	BPF_XDP_GEN = 57,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+--- a/drivers/hwmon/acpi_power_meter.c
++++ b/drivers/hwmon/acpi_power_meter.c
+@@ -999,6 +999,7 @@
+ MODULE_AUTHOR("Darrick J. Wong <darrick.wong@oracle.com>");
+ MODULE_DESCRIPTION("ACPI 4.0 power meter driver");
+ MODULE_LICENSE("GPL");
++MODULE_SOFTDEP("pre: ipmi_si acpi_ipmi");
+ 
+ module_param(force_cap_on, bool, 0644);
+ MODULE_PARM_DESC(force_cap_on, "Enable power cap even it is unsafe to do so.");
+--- a/drivers/acpi/acpi_ipmi.c
++++ b/drivers/acpi/acpi_ipmi.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/module.h>
+ #include <linux/acpi.h>
++#include <linux/dmi.h>
+ #include <linux/ipmi.h>
+ #include <linux/spinlock.h>
+ 
+@@ -442,11 +443,20 @@
+ 	if (err)
+ 		return;
+ 
+-	if (smi_data.addr_src != SI_ACPI)
++	handle = NULL;
++	if (smi_data.addr_src == SI_ACPI) {
++		handle = smi_data.addr_info.acpi_info.acpi_handle;
++		if (!handle)
++			goto err_ref;
++	} else if (smi_data.addr_src != SI_SMBIOS ||
++		   !dmi_match(DMI_SYS_VENDOR, "Dell Inc.")) {
+ 		goto err_ref;
+-	handle = smi_data.addr_info.acpi_info.acpi_handle;
+-	if (!handle)
+-		goto err_ref;
++	}
++	/*
++	 * Dell firmware can expose an IPMI PNP device while registering
++	 * the working local BMC through SMBIOS. The opregion has no
++	 * interface selector, so use this BMC as an ACPI fallback.
++	 */
+ 
+ 	ipmi_device = ipmi_dev_alloc(iface, smi_data.dev, handle);
+ 	if (!ipmi_device) {
+@@ -456,14 +466,13 @@
+ 
+ 	mutex_lock(&driver_data.ipmi_lock);
+ 	list_for_each_entry(temp, &driver_data.ipmi_devices, head) {
+-		/*
+-		 * if the corresponding ACPI handle is already added
+-		 * to the device list, don't add it again.
+-		 */
+-		if (temp->handle == handle)
++		/* Keep interface registrations and ACPI handles unique. */
++		if (temp->ipmi_ifnum == iface ||
++		    (handle && temp->handle == handle))
+ 			goto err_lock;
+ 	}
+-	if (!driver_data.selected_smi)
++	if (!driver_data.selected_smi ||
++	    (handle && !driver_data.selected_smi->handle))
+ 		driver_data.selected_smi = ipmi_device;
+ 	list_add_tail(&ipmi_device->head, &driver_data.ipmi_devices);
+ 	mutex_unlock(&driver_data.ipmi_lock);

@@ -928,8 +928,6 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_SCHED_ACT,
 	BPF_PROG_TYPE_TRACEPOINT,
 	BPF_PROG_TYPE_XDP,
-	BPF_PROG_TYPE_XDP_EGRESS,
-	BPF_PROG_TYPE_XDP_GEN,
 	BPF_PROG_TYPE_PERF_EVENT,
 	BPF_PROG_TYPE_CGROUP_SKB,
 	BPF_PROG_TYPE_CGROUP_SOCK,
@@ -955,6 +953,9 @@ enum bpf_prog_type {
 	BPF_PROG_TYPE_LSM,
 	BPF_PROG_TYPE_SK_LOOKUP,
 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+	/* eTran extensions keep existing UAPI values stable. */
+	BPF_PROG_TYPE_XDP_EGRESS = 33,
+	BPF_PROG_TYPE_XDP_GEN = 34,
 };
 
 enum bpf_attach_type {
@@ -1002,6 +1003,9 @@ enum bpf_attach_type {
 	BPF_PERF_EVENT,
 	BPF_TRACE_KPROBE_MULTI,
 	BPF_LSM_CGROUP,
+	/* eTran extensions keep existing UAPI values stable. */
+	BPF_XDP_EGRESS = 56,
+	BPF_XDP_GEN = 57,
 	__MAX_BPF_ATTACH_TYPE
 };
 
