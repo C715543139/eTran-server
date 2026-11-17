@@ -37,6 +37,7 @@ struct eTran_netaddr
 enum req_type {
     REG,
     UNREG,
+    REG_CPU,
 };
 
 enum tcp_type {
@@ -75,6 +76,7 @@ enum resp_type {
     REG_FAIL,
     REG_DONE,
     UNKNWON,
+    REG_CPU_READY,
 };
 
 /* response format used for control path response */

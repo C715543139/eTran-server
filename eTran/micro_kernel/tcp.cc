@@ -34,14 +34,6 @@ std::list<struct tcp_connection *> tcp_handshake_list;
 // ebpf.cc
 extern class eTranTCP *etran_tcp;
 
-//control_plane.cc
-#ifdef ALLOCATION
-extern std::set<int, std::greater<int>>  availableCores;
-extern std::vector<int> latUsingCores;
-extern std::vector<int> throughputUsingCores;
-extern int cpuUseRef[MAX_CPU], cpuLatUseRef[MAX_CPU];
-#endif
-
 static inline int alloc_cc_idx(uint32_t *idx)
 {
     if (etran_tcp->_avail_cc_idxs.empty())
@@ -1634,40 +1626,4 @@ void free_tcp_resources(struct app_ctx *actx)
     /* traverse tcp_connections and tcp_listeners and free them */
     free_connections(actx);
     free_listeners(actx);
-    #ifdef ALLOCATION
-    //TODO:遍历usedCores并更改引用计数，针对归零的CPU进行返回
-    int cpuNum=sysconf(_SC_NPROCESSORS_ONLN)-1;
-    for (auto cpu : actx->usedCores) {
-        if (cpu==cpuNum) {
-            std::cout<<"Error, the last core should not be allocated beacuse of micro_kernel!"<<std::endl;
-            assert(0);
-        }
-        cpuUseRef[cpu]--;
-        if (cpuUseRef[cpu]<0) {
-            std::cout<<"Error, cpuUseRef["<<cpu<<"] is negative!"<<std::endl;
-            assert(0);
-        }
-        if (actx->tcp_type==LATENCY) {
-            cpuLatUseRef[cpu]--;
-            if (cpuLatUseRef[cpu]<0) { 
-                std::cout<<"Error, cpuLatUseRef["<<cpu<<"] is negative!"<<std::endl;
-                assert(0);
-            } else if (cpuLatUseRef[cpu]==0) {
-                latUsingCores.erase(std::find(latUsingCores.begin(), latUsingCores.end(), cpu));
-                if (cpuUseRef[cpu]>0) {//还有throughput应用在使用，需要加入throughput集合，这里micro_kernel串行接收指令并处理，所以不考虑并发问题
-                    std::cout<<"Latency Return CPU >> "<<cpu<<" to throughputUsingCores"<<std::endl;
-                    throughputUsingCores.push_back(cpu);
-                } else if (cpuUseRef[cpu]==0) {//没有应用在使用，归还
-                    std::cout<<"Latency Return CPU >> "<<cpu<<" to availableCores"<<std::endl;
-                    availableCores.insert(cpu);
-                }
-            }
-        } else {
-            if (cpuUseRef[cpu]==0) {//没有应用在使用，归还
-                std::cout<<"Throughput Return CPU >> "<<cpu<<" to availableCores"<<std::endl;
-                availableCores.insert(cpu);
-            }
-        }
-    }
-    #endif
 }

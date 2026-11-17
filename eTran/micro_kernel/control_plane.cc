@@ -139,7 +139,7 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
 static void destroy_rss_context(struct app_ctx *actx);
 
 /* manage application resources */
-static int alloc_app_resources(struct register_request &req, int fd);
+static int alloc_app_resources(struct register_request &req, int fd, int requested_app_cpu);
 static void free_app_resources(struct app_ctx *actx);
 
 /* called when microkernel exits */
@@ -464,29 +464,61 @@ int getCoreRoundRobin(std::vector<int> *candidate, int *nxtIdx, int threshold, i
     return retCore;
 }
 
-int getCore(int type) {
-    const char *fixed_cpu = std::getenv(type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
-    if (fixed_cpu) {
-        char *end = nullptr;
-        errno = 0;
-        long cpu = strtol(fixed_cpu, &end, 10);
-        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || cpu == CP_CPU) {
-            fprintf(stderr, "Invalid fixed CPU: %s\n", fixed_cpu);
-            exit(EXIT_FAILURE);
-        }
-        availableCores.erase(cpu);
-        if (type == LATENCY) {
-            throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
-            if (std::find(latUsingCores.begin(), latUsingCores.end(), cpu) == latUsingCores.end()) {
-                latUsingCores.push_back(cpu);
-            }
-            cpuLatUseRef[cpu]++;
-        } else if (cpuLatUseRef[cpu] == 0 && std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
-            throughputUsingCores.push_back(cpu);
-        }
-        cpuUseRef[cpu]++;
-        return cpu;
+static bool valid_app_cpu(int cpu)
+{
+    if (cpu < 0 || cpu >= MAX_CPU || cpu == CP_CPU)
+        return false;
+    if (cpu == 0)
+        return true;
+    std::ifstream online("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/online");
+    int enabled = 0;
+    return (online >> enabled) && enabled == 1;
+}
+
+static int reserve_cpu(int type, int cpu)
+{
+    if (!valid_app_cpu(cpu))
+        return -EINVAL;
+    availableCores.erase(cpu);
+    if (type == LATENCY) {
+        throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
+        if (std::find(latUsingCores.begin(), latUsingCores.end(), cpu) == latUsingCores.end())
+            latUsingCores.push_back(cpu);
+        cpuLatUseRef[cpu]++;
+    } else if (cpuLatUseRef[cpu] == 0 && std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
+        throughputUsingCores.push_back(cpu);
     }
+    cpuUseRef[cpu]++;
+    return cpu;
+}
+
+static void release_app_cpus(struct app_ctx *actx)
+{
+    for (int cpu : actx->usedCores) {
+        assert(cpuUseRef[cpu] > 0);
+        cpuUseRef[cpu]--;
+        if (actx->tcp_type == LATENCY) {
+            assert(cpuLatUseRef[cpu] > 0);
+            cpuLatUseRef[cpu]--;
+        }
+        if (cpuLatUseRef[cpu] == 0) {
+            latUsingCores.erase(std::remove(latUsingCores.begin(), latUsingCores.end(), cpu), latUsingCores.end());
+            if (cpuUseRef[cpu] == 0) {
+                throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
+                availableCores.insert(cpu);
+            } else if (std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
+                throughputUsingCores.push_back(cpu);
+            }
+        }
+        printf("CPU release pid=%d cpu=%d refs=%d latency_refs=%d available=%d\n",
+               actx->pid, cpu, cpuUseRef[cpu], cpuLatUseRef[cpu], availableCores.count(cpu) != 0);
+    }
+    actx->usedCores.clear();
+}
+
+int getCore(int type, int requested_cpu = -1) {
+    if (requested_cpu >= 0)
+        return reserve_cpu(type, requested_cpu);
     //从nxtIdx开始寻找第一个负载低于thresh的，如果没有则额外生成一个CPU，并重置nxtIdx
     //如果是lat的话搜寻次序依次为latUsingCores, throughputUsingCores, availableCores;
     //如果是throughput的话为throughputUsingCores, availableCores
@@ -519,14 +551,14 @@ int getCore(int type) {
                     latUsingCores.push_back(retCore);
                     nxtLatencyIdx=latUsingCores.size()-1;//定位到最后一个新加入的
                 } else {//全部分配失败，从latency中找下一个
+                    if (latUsingCores.empty())
+                        return -ENOSPC;
                     retCore=latUsingCores[nxtLatencyIdx%latUsingCores.size()];
                     nxtLatencyIdx=(nxtLatencyIdx+1)%latUsingCores.size();
                 }
             }
         }
-        cpuLatUseRef[retCore]++;
-        cpuUseRef[retCore]++;
-        return retCore;
+        return reserve_cpu(type, retCore);
     } else if (type==THROUGHPUT) {
         retCore=getCoreRoundRobin(&throughputUsingCores, &nxtThroughputIdx, throughputLoadThreshold, &locIdx);
         if (retCore!=-1) {
@@ -539,12 +571,13 @@ int getCore(int type) {
                 throughputUsingCores.push_back(retCore);
                 nxtThroughputIdx=throughputUsingCores.size()-1;//定位到最后一个新加入的
             } else {//全部分配失败，从throughput中找下一个
+                if (throughputUsingCores.empty())
+                    return -ENOSPC;
                 retCore=throughputUsingCores[nxtThroughputIdx%throughputUsingCores.size()];
                 nxtThroughputIdx=(nxtThroughputIdx+1)%throughputUsingCores.size();
             }
         }
-        cpuUseRef[retCore]++;
-        return retCore;
+        return reserve_cpu(type, retCore);
     } else {
         std::cout<<"Error wrong type in getCore()"<<std::endl;
         assert(0);
@@ -620,72 +653,45 @@ static int get_irq_for_queue(const std::string& iface, int qid)
     
 }
 
-static void bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads) {
-
-    std::string cmd;
-    int cpu_count = sysconf(_SC_NPROCESSORS_ONLN)-1;  // 获取 CPU 核心总数
-    int baseCore, mod;
-    if (actx->tcp_type == TCP_LATENCY) {
-        for (unsigned int i = 0; i < nr_nic_queues; i++) {
-            int qidx = qids[i];
-            int irq = get_irq_for_queue(etran_nic->_if_name, qidx);  // 需要实现
-            if (irq==-1) {
-                std::cout<<"Error, failed to find the IRQ for queue "<< qidx << std::endl;
-                assert(0);
-            }
-            int target_cpu = getCore(LATENCY);         // 针对latency，优先进行分配；
-            actx->usedCores.push_back(target_cpu);
-
-            unsigned long mask = 1UL << target_cpu;
-            char mask_str[64];
-            snprintf(mask_str, sizeof(mask_str), "%lx", mask);
-
-            std::string irq_affinity_path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity";
-            FILE *fp = fopen(irq_affinity_path.c_str(), "w");
-            if (fp) {
-                fprintf(fp, "%s\n", mask_str);
-                fclose(fp);
-                std::cout<<"Latency: Queue "<< qidx << " (IRQ " << irq << ") bound to CPU " << target_cpu << std::endl;
-            } else {
-                perror("Failed to set smp_affinity");
-            }
-        }
-        for (unsigned int i=0; i<actx->nr_app_threads;i++) {
-            int core=getCore(LATENCY);
-            actx->usedCores.push_back(core);
-        }
-    } else if (actx->tcp_type == TCP_THROUGHPUT) {
-
-        for (unsigned int i = 0; i < nr_nic_queues; i++) {
-            int qidx = qids[i];
-            int irq = get_irq_for_queue(etran_nic->_if_name, qidx);
-            if (irq==-1) {
-                std::cout<<"Error, failed to find the IRQ for queue "<< qidx << std::endl;
-                assert(0);
-            }
-            int target_cpu = getCore(THROUGHPUT);//针对throughput，等CPU负载变高之后再分配
-            actx->usedCores.push_back(target_cpu);
-
-            // 将 CPU ID 转换为 bitmask（简单场景）
-            unsigned long mask = 1UL << target_cpu;
-            char mask_str[64];
-            snprintf(mask_str, sizeof(mask_str), "%lx", mask);
-
-            std::string irq_affinity_path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity";
-            FILE *fp = fopen(irq_affinity_path.c_str(), "w");
-            if (fp) {
-                fprintf(fp, "%s\n", mask_str);
-                fclose(fp);
-                std::cout<<"Throughput: Queue "<< qidx << " (IRQ " << irq << ") bound to CPU " << target_cpu << std::endl;
-            } else {
-                perror("Failed to set smp_affinity");
-            }
-        }
-        for (int i=0; i<nr_app_threads; i++) {
-            int core = getCore(THROUGHPUT);//针对throughput，等CPU负载变高之后再分配
-            actx->usedCores.push_back(core);
-        }
+static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads) {
+    int irq_cpu = -1;
+    const char *fixed_cpu = std::getenv(actx->tcp_type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
+    if (fixed_cpu) {
+        char *end = nullptr;
+        errno = 0;
+        long cpu = strtol(fixed_cpu, &end, 10);
+        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || !valid_app_cpu(cpu))
+            return -EINVAL;
+        irq_cpu = cpu;
     }
+    for (unsigned int i = 0; i < nr_nic_queues; i++) {
+        int irq = get_irq_for_queue(etran_nic->_if_name, qids[i]);
+        if (irq < 0)
+            return -ENOENT;
+        int cpu = getCore(actx->tcp_type, irq_cpu);
+        if (cpu < 0)
+            return cpu;
+        actx->usedCores.push_back(cpu);
+        std::string path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity_list";
+        FILE *fp = fopen(path.c_str(), "w");
+        if (!fp)
+            return -errno;
+        int written = fprintf(fp, "%d\n", cpu);
+        int closed = fclose(fp);
+        if (written < 0 || closed != 0)
+            return -EIO;
+        printf("CPU allocation pid=%d role=IRQ queue=%u cpu=%d refs=%d latency_refs=%d\n",
+               actx->pid, qids[i], cpu, cpuUseRef[cpu], cpuLatUseRef[cpu]);
+    }
+    for (unsigned int i = 0; i < nr_app_threads; i++) {
+        int cpu = getCore(actx->tcp_type, actx->requested_app_cpu);
+        if (cpu < 0)
+            return cpu;
+        actx->usedCores.push_back(cpu);
+        printf("CPU allocation pid=%d role=APP thread=%u cpu=%d refs=%d latency_refs=%d\n",
+               actx->pid, i, cpu, cpuUseRef[cpu], cpuLatUseRef[cpu]);
+    }
+    return 0;
 }
 #endif
 
@@ -735,7 +741,8 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
         return -1;
     }
 #if defined(ALLOCATION)
-    if (actx->proto==IPPROTO_TCP) bind_rss_core(actx,nr_nic_queues,qids,nr_app_threads);
+    if (actx->proto == IPPROTO_TCP)
+        return bind_rss_core(actx, nr_nic_queues, qids, nr_app_threads);
 #endif
     return 0;
 }
@@ -807,6 +814,9 @@ static void free_app_resources(struct app_ctx *actx)
     if (actx->proto == IPPROTO_TCP)
     {
         free_tcp_resources(actx);
+#ifdef ALLOCATION
+        release_app_cpus(actx);
+#endif
     }
 
     if (actx->proto == IPPROTO_HOMA)
@@ -857,8 +867,10 @@ static void free_app_resources(struct app_ctx *actx)
 
     bp_free(&actx->bpw);
 
-    for (unsigned int i = 0; i < actx->nr_app_threads; i++)
+    for (unsigned int i = 0; i < actx->nr_app_threads; i++) {
         shm_wrapper_destroy(actx->tctx[i].lrpc);
+        close(actx->tctx[i].evfd);
+    }
 }
 
 static void destroy_all_apps(void)
@@ -948,10 +960,13 @@ static void response_app_req(int app_fd, enum resp_type type)
         for (unsigned int i = 0; i < actx->nr_app_threads; i++)
             transfer_fds(app_fd, actx->tctx[i].txrx_xsk_fd, actx->nr_nic_queues);
         break;
+    case REG_CPU_READY:
     case REG_EVENT_FD:
         resp.type = type;
         if (write_all(app_fd, &resp, sizeof(resp)) != sizeof(resp))
             return;
+        if (type == REG_CPU_READY)
+            break;
         for (unsigned int i = 0; i < actx->nr_app_threads; i++)
             transfer_fd(app_fd, actx->tctx[i].evfd);
         break;
@@ -1142,7 +1157,7 @@ static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, st
 // step2: create slow-path XSKs and rings(rx,tx,fill,comp), bind them to the UMEM 
 // step3: create TX/RX XSKs (nr_nic_queues * nr_app_threads) step4:
 // register XSK fd to the XSK map
-static int alloc_app_resources(struct register_request &req, int fd)
+static int alloc_app_resources(struct register_request &req, int fd, int requested_app_cpu)
 {
     int xsk_fd;
     struct app_ctx *actx;
@@ -1151,11 +1166,21 @@ static int alloc_app_resources(struct register_request &req, int fd)
     socklen_t optlen = sizeof(xdp_opts);
     int tran_idx;
 
-    if (req.nr_app_threads > MAX_APP_THREADS)
+    if (req.nr_app_threads == 0 || req.nr_app_threads > MAX_APP_THREADS ||
+        req.nr_nic_queues == 0 || req.nr_nic_queues > MAX_NIC_QUEUES)
     {
         fprintf(stderr, "alloc_app_resources: too many threads");
         return -E2BIG;
     }
+
+#ifdef ALLOCATION
+    if (req.proto == IPPROTO_TCP &&
+        ((req.tcp_type != LATENCY && req.tcp_type != THROUGHPUT) ||
+         requested_app_cpu < -1 ||
+         (requested_app_cpu >= 0 && !valid_app_cpu(requested_app_cpu)))) {
+        return -EINVAL;
+    }
+#endif
 
     if (req.proto != IPPROTO_TCP) {
         if (req.queue_usage != Q_EXCLUSIVE) {
@@ -1194,6 +1219,7 @@ static int alloc_app_resources(struct register_request &req, int fd)
 #if defined(ALLOCATION)
     actx->tcp_type = req.tcp_type;
     actx->usedCores = std::list<int>();
+    actx->requested_app_cpu = requested_app_cpu;
 #endif
 
     if (init_lrpc_channels(actx, SHM_LRPC_PREFIX))
@@ -1329,11 +1355,13 @@ static int alloc_app_resources(struct register_request &req, int fd)
     }
     printf("register XSK map for application success\n");
     printf("req.nr_app_threads(%u), req.nr_nic_queues(%u)\n", req.nr_app_threads, req.nr_nic_queues);
-    if (create_rss_context(actx, req.nr_nic_queues, qids, req.nr_app_threads))
-        goto err;
-
     if (thread_bcache_create(&actx->bpw, &actx->iobuffer))
         goto err;
+
+    if (int error = create_rss_context(actx, req.nr_nic_queues, qids, req.nr_app_threads)) {
+        free_app_resources(actx);
+        return error;
+    }
 
     actx->done = true;
 
@@ -1374,19 +1402,8 @@ err:
 
 static int process_app_req(int fd, struct register_request *req)
 {
-    struct msghdr message;
-    struct iovec iov[1];
-
-    memset(&message, 0, sizeof(message));
     memset(req, 0, sizeof(*req));
-
-    iov[0].iov_base = req;
-    iov[0].iov_len = sizeof(*req);
-
-    message.msg_iov = iov;
-    message.msg_iovlen = 1;
-
-    if (recvmsg(fd, &message, 0) < 0)
+    if (read_all(fd, req, sizeof(*req)) != sizeof(*req))
         return -1;
 
     return 0;
@@ -1507,8 +1524,18 @@ static int poll_uds(int timeout_ms)
                 switch (req.type)
                 {
                 case REG:
+                case REG_CPU: {
+                    int requested_app_cpu = -1;
+                    if (req.type == REG_CPU) {
+                        response_app_req(events[i].data.fd, REG_CPU_READY);
+                        if (read_all(events[i].data.fd, &requested_app_cpu, sizeof(requested_app_cpu)) != sizeof(requested_app_cpu)) {
+                            epoll_ctl(epfd, EPOLL_CTL_DEL, events[i].data.fd, nullptr);
+                            destroy_app(events[i].data.fd);
+                            break;
+                        }
+                    }
                     printf("Receive REG command for app_fd:%d\n", events[i].data.fd);
-                    if (alloc_app_resources(req, events[i].data.fd))
+                    if (alloc_app_resources(req, events[i].data.fd, requested_app_cpu))
                     {
                         fprintf(stderr, "alloc_app_resources failed\n");
                         response_app_req(events[i].data.fd, REG_FAIL);
@@ -1520,6 +1547,7 @@ static int poll_uds(int timeout_ms)
                         response_app_req(events[i].data.fd, REG_DONE);
                     }
                     break;
+                }
                 case UNREG:
                     printf("Receive UNREG command for app_fd:%d\n", events[i].data.fd);
                     destroy_app(events[i].data.fd);

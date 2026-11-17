@@ -27,10 +27,8 @@ static std::mutex actx_lock;
 static unsigned int tctx_id = 0;
 #ifdef ALLOCATION
     static struct tcpState {
-        int type;//0-LATENCY, 1-THROUGHPUT
         int cpuLen;
-        int cpus[MAX_APP_THREADS+MAX_NIC_QUEUES];//表示当前APP分配到的CPU，pthread_create时利用这个来进行CPU亲和性设置
-        int guard_value;
+        int cpus[MAX_APP_THREADS];
     } tcp_state;
 #endif
 
@@ -315,6 +313,8 @@ static int _resource_free(void)
 
     for (unsigned int i = 0; i < actx->nr_nic_queues; i++)
     {
+        if (actx->nic_qid[i] == static_cast<unsigned int>(-1))
+            continue;
         int qidx = actx->qid2idx[actx->nic_qid[i]];
         if (actx->uring[qidx].fill_map_size)
             munmap(actx->uring[qidx].fill_map, actx->uring[qidx].fill_map_size);
@@ -371,48 +371,13 @@ err:
 
 #ifdef ALLOCATION
 extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg) {
-        std::cout<<"=============================================="<<std::endl;
-    auto now_us = []{ struct timeval tv; gettimeofday(&tv,nullptr);
-                  return tv.tv_sec*1000000ull + tv.tv_usec; };
-
-    std::cout<<"cpu size is "<<tcp_state.cpuLen<<std::endl;
-    for (int i=0; i<tcp_state.cpuLen; i++) {
-        std::cout<<tcp_state.cpus[i]<<" ";
-        if (i==tcp_state.cpuLen-1) std::cout<<std::endl;
+    if (!tcp_state.cpuLen) {
+        return libc_pthread_create(thread, attr, start_routine, arg);
     }
     cpu_set_t cpuSet;
     CPU_ZERO(&cpuSet);
-    int cpu_count=sysconf(_SC_NPROCESSORS_ONLN)-1;
-    if (tcp_state.type==THROUGHPUT) {
-        for (int i = 0; i < cpu_count/2; ++i) {
-            CPU_SET(i, &cpuSet);
-        }
-        for (int i=0;i<tcp_state.cpuLen;i++) {
-            CPU_SET(tcp_state.cpus[i], &cpuSet);
-        }
-    } else if (tcp_state.type==LATENCY) {
-        for (int i = cpu_count/2 ; i < cpu_count/2+2; ++i) {
-            CPU_SET(i, &cpuSet);
-        }
-        for (int i=0;i<tcp_state.cpuLen;i++) {
-            CPU_SET(tcp_state.cpus[i], &cpuSet);
-        }
-    } else {
-        std::cout<<"Error, invalid tcp_type in pthread_create!"<<std::endl;
-        assert(0);
-    }
-
-    const char *fixed_cpu = std::getenv("ETRAN_APP_CPU");
-    if (fixed_cpu) {
-        char *end = nullptr;
-        errno = 0;
-        long cpu = strtol(fixed_cpu, &end, 10);
-        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= CPU_SETSIZE || cpu >= sysconf(_SC_NPROCESSORS_ONLN)) {
-            fprintf(stderr, "Invalid application CPU: %s\n", fixed_cpu);
-            exit(EXIT_FAILURE);
-        }
-        CPU_ZERO(&cpuSet);
-        CPU_SET(cpu, &cpuSet);
+    for (int i = 0; i < tcp_state.cpuLen; i++) {
+        CPU_SET(tcp_state.cpus[i], &cpuSet);
     }
 
     pthread_attr_t local_attr;
@@ -455,15 +420,31 @@ int eTran_init(struct eTran_cfg *cfg)
     size_t shm_lrpc_size;
     struct ucred cred;
     socklen_t ucred_len = sizeof(struct ucred);
+    int requested_app_cpu = -1;
 
     signal(SIGUSR1, eTran_intr);
     if (!cfg || 
         (cfg->proto != IPPROTO_TCP && cfg->proto != IPPROTO_HOMA) || 
-            cfg->nr_nic_queues == 0 || cfg->nr_app_threads == 0)
+            cfg->nr_nic_queues == 0 || cfg->nr_app_threads == 0 ||
+            cfg->nr_nic_queues > MAX_NIC_QUEUES || cfg->nr_app_threads > MAX_APP_THREADS)
         return -EINVAL;
 
     if (actx)
         return -EEXIST;
+
+#ifdef ALLOCATION
+    const char *fixed_cpu = std::getenv("ETRAN_APP_CPU");
+    if (fixed_cpu && cfg->proto == IPPROTO_TCP) {
+        char *end = nullptr;
+        errno = 0;
+        long cpu = strtol(fixed_cpu, &end, 10);
+        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= CPU_SETSIZE) {
+            fprintf(stderr, "Invalid application CPU: %s\n", fixed_cpu);
+            return -EINVAL;
+        }
+        requested_app_cpu = cpu;
+    }
+#endif
 
     actx = new app_ctx();
     if (!actx)
@@ -474,7 +455,6 @@ int eTran_init(struct eTran_cfg *cfg)
     actx->nr_app_threads = cfg->nr_app_threads;
 #if defined(ALLOCATION)
     actx->tcp_type=cfg->tcp_type;
-    tcp_state.type=cfg->tcp_type;
 #endif
 
     actx->fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -503,7 +483,7 @@ int eTran_init(struct eTran_cfg *cfg)
     actx->pid = cred.pid;
 
     /* craft register request */
-    req.type = REG;
+    req.type = requested_app_cpu >= 0 ? REG_CPU : REG;
     req.proto = cfg->proto;
     req.nr_nic_queues = cfg->nr_nic_queues;
     req.nr_app_threads = cfg->nr_app_threads;
@@ -523,8 +503,17 @@ int eTran_init(struct eTran_cfg *cfg)
     }
 #endif
 
-    if (write_all(actx->fd, &req, sizeof(req)) < 0)
+    if (write_all(actx->fd, &req, sizeof(req)) != sizeof(req))
         return -EIO;
+
+    if (req.type == REG_CPU) {
+        if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp))
+            return -EIO;
+        if (resp.type != REG_CPU_READY)
+            return -EPROTONOSUPPORT;
+        if (write_all(actx->fd, &requested_app_cpu, sizeof(requested_app_cpu)) != sizeof(requested_app_cpu))
+            return -EIO;
+    }
 
     /* receive AF_XDP socket fds, including control path fds and data path fds */
     if (read_all(actx->fd, &resp, sizeof(resp)) < 0 || resp.type != REG_XSK_FD)
@@ -566,15 +555,26 @@ int eTran_init(struct eTran_cfg *cfg)
         return -EIO;
 
 #ifdef ALLOCATION
-    //TODO: 在这里注入pthread_create函数，使其只能被绑定到接收到的CPU上
-    tcp_state.cpuLen = resp.cpuLen;
-    for (int i=0; i<resp.cpuLen; i++) {
-        tcp_state.cpus[i] = resp.cpus[i];
-        std::cout<<"cpu "<<resp.cpus[i]<<" is pushed into tcp_state.cpus"<<std::endl;
+    if (resp.cpuLen != actx->nr_nic_queues + actx->nr_app_threads ||
+        actx->nr_app_threads > MAX_APP_THREADS) {
+        return -EPROTO;
     }
-    for (int i=0; i<tcp_state.cpuLen; i++) {
-        std::cout<<"cpu "<<tcp_state.cpus[i]<<" is in tcp_state.cpus"<<std::endl;
+    cpu_set_t application_cpus;
+    CPU_ZERO(&application_cpus);
+    for (unsigned int i = 0; i < actx->nr_app_threads; i++) {
+        int cpu = resp.cpus[actx->nr_nic_queues + i];
+        if (cpu < 0 || cpu >= CPU_SETSIZE ||
+            (requested_app_cpu >= 0 && cpu != requested_app_cpu)) {
+            return -EPROTO;
+        }
+        tcp_state.cpus[i] = cpu;
+        CPU_SET(cpu, &application_cpus);
+        printf("Registered application CPU[%u]=%d\n", i, cpu);
     }   
+    int affinity_error = pthread_setaffinity_np(pthread_self(), sizeof(application_cpus), &application_cpus);
+    if (affinity_error)
+        return -affinity_error;
+    tcp_state.cpuLen = actx->nr_app_threads;
 #endif
     shm_bp_size = resp.shm_bp_size;
     shm_umem_size = resp.shm_umem_size;
@@ -664,6 +664,11 @@ void eTran_exit(void)
 {
     if (!actx)
         return;
+    if (!actx->done) {
+        delete actx;
+        actx = nullptr;
+        return;
+    }
     struct register_request req = {};
 
     _resource_free();
@@ -689,8 +694,12 @@ void eTran_exit(void)
         return;
 
     close(actx->fd);
-
-    free(actx);
+    actx->fd = -1;
+    delete actx;
+    actx = nullptr;
+#ifdef ALLOCATION
+    tcp_state.cpuLen = 0;
+#endif
 
     printf("eTran exit successfully.\n");
 }
@@ -735,7 +744,6 @@ void pre_main(int argc, char *argv[])
     }
 #ifdef ALLOCATION
     INTERCEPT_FUNCTION(pthread_create);
-    tcp_state.type=2;
     tcp_state.cpuLen=0;
 #endif
 

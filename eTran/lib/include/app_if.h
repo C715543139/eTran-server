@@ -249,6 +249,7 @@ struct app_ctx {
             tctx[i].fqk = 0;
             tctx[i].cached_fqidx = fixed_size_vector_32<unsigned int>(32);
             tctx[i].mp = NULL;
+            tctx[i].iobuffer = {};
             tctx[i].next_rcv_qidx = 0;
             tctx[i].lrpc = NULL;
             tctx[i].app_in = {0};

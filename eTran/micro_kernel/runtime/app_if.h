@@ -100,10 +100,12 @@ struct app_ctx
 
     #if defined(ALLOCATION)
     int tcp_type;//TCP type 0 for Latency, 1 for Throughput
+    // IRQ CPUs first, then application CPUs, with one entry per reservation.
     std::list<int> usedCores;
+    int requested_app_cpu = -1;
     #endif
 
-    app_ctx() {}
+    app_ctx() : rss_ctx_id(0) {}
 };
 
 struct apps_info
