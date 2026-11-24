@@ -1089,13 +1089,8 @@ err:
     return -ENOMEM;
 }
 
-static bool lstQueuePoped=false;
 static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, std::vector<unsigned int> &qids) {
     qids.clear();
-    if (!lstQueuePoped) {
-        etran_nic->_free_exclusive_qids.pop_back();
-        lstQueuePoped=true;
-    }
     switch (hint) {
     case Q_EXCLUSIVE:
         if (etran_nic->_free_exclusive_qids.size() < nr_queues) {
