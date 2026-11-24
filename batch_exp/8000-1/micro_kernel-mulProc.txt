@@ -1,7 +1,0 @@
-[Step1] System init done.
-[Step2] NIC init done.
-[Step3] Microkernel context init done.
-	TCP: Timing wheel init done.
-	Homa: Default workload type w5.
-[Step4] eBPF init done.
-[Step5] Threads init done.

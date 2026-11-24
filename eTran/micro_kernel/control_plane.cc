@@ -53,12 +53,7 @@
 #define TICK_US 1000
 #include <regex>      // std::regex、std::smatch、std::regex_search
 #include <fstream>    // std::ifstream
-#define latNum 2 //cores reserver for latency apps, front half for XDP and back half for APP
-#define TCP_LATENCY 0
-#define TCP_THROUGHPUT 1
 #define COMP_BASE 1
-int nxtThroughputCore=0;
-int nxtLatencyCore=0;
 
 /* Unidx domain socket for application enrollment */
 int uds_sockfd;
@@ -430,28 +425,6 @@ int get_least_loaded_cpu(const std::set<int> *candidate, int *cpuId, int *cpuOve
     }
     return (minLoad < 100) ? 0 : -1;
 }
-
-// int create_new_cpu(int type) {
-//     std::vector<int> *replenish=nullptr;
-//     if (type==LATENCY) {
-//         replenish=&latencyCores;
-//     } else if (type==THROUGHPUT) {
-//         replenish=&throughputCores;
-//     } else {
-//         std::cout<<"Error wrong type in create_new_cpu()"<<std::endl;
-//         assert(0);
-//     }
-//     if (availableCores.empty()) {
-//         std::cout<<"Warning no available cores in create_new_cpu()"<<std::endl;
-//         return -1;
-//     } else {
-//         int newCore=*availableCores.begin();
-//         availableCores.erase(availableCores.begin());
-//         replenish->push_back(newCore);
-//         std::cout<<"Overload too high! Created new core: "<<newCore<<" for type "<<type<<std::endl;
-//         return newCore;
-//     }
-// }
 
 static bool valid_app_cpu(int cpu)
 {

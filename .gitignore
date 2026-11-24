@@ -14,6 +14,19 @@ lib/libbpf-install/
 llvm.sh
 bpftool/
 experiments/
+/eTran/tcp_app/2.txt
+/eTran/tcp_app/3.txt
+/eTran/tcp_app/4.txt
+/eTran/tcp_app/cpu_usage.log
+/eTran/xdp.log
+/batch_exp/metrics.log
+/batch_exp/avg.pdf
+/batch_exp/large.pdf
+/batch_exp/small.pdf
+/batch_exp/[0-9]*/[0-3].txt
+/batch_exp/[0-9]*/micro_kernel-mulProc.txt
+/batch_exp/[0-9]*/micro_kernel-mulThread.txt
+/batch_exp/[0-9]*/serverMulThread.txt
 
 # Ignore all executables
 bench-afxdp/xdpsock

@@ -55,14 +55,11 @@ static int set_affinity(std::string pcie_name)
         res.erase(0, pos + delimiter.length());
     }
 
-    unsigned int affinity_value = 1;
-    for (int irq : irq_list)
+    for (size_t cpu = 0; cpu < irq_list.size(); ++cpu)
     {
-        std::stringstream ss;
-        ss << "echo " << std::setw(5) << std::setfill('0') << std::hex << affinity_value
-           << " > /proc/irq/" << std::dec << irq << "/smp_affinity";
-
-        std::string cmd = ss.str();
+        int irq = irq_list[cpu];
+        std::string cmd = "echo " + std::to_string(cpu) + " > /proc/irq/" +
+                          std::to_string(irq) + "/smp_affinity_list";
 
         if (!exec_cmd(cmd))
         {
@@ -70,7 +67,6 @@ static int set_affinity(std::string pcie_name)
             return -1;
         }
 
-        affinity_value <<= 1;
     }
     return 0;
 }
