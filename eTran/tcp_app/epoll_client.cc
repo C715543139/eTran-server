@@ -31,7 +31,7 @@ unsigned int nr_flows = 1;
 unsigned int nr_threads = 1;
 unsigned int nr_queues = 1;
 unsigned int message_bytes = 100;
-unsigned int send_interval_us = 2000;
+unsigned int send_interval_us = 0;
 std::string server_ip_str = "192.168.6.2";
 uint16_t server_port = 50000;
 
@@ -77,6 +77,7 @@ static inline int connection_send(unsigned int tid, struct connection *c)
     ssize_t ret;
     uint32_t target_bytes;
     int need_epoll_out = 0;
+    const bool had_pending = c->pending_bytes != 0;
     // Transmit messages as much as possible through this connection until we reach max_outstanding or no buffer space
     while (c->pending_bytes) {
         target_bytes = std::min(c->pending_bytes, c->message_bytes);
@@ -91,7 +92,9 @@ static inline int connection_send(unsigned int tid, struct connection *c)
             break;
         }
     }
-    if (send_interval_us) {
+    // Delay only after draining the batch. This pauses the worker, so use
+    // one flow and one outstanding request for per-request pacing.
+    if (send_interval_us && had_pending && c->pending_bytes == 0) {
         usleep(send_interval_us);
     }
     return need_epoll_out;
@@ -323,7 +326,7 @@ int parse_args(int argc, char *argv[])
                     " [-w wait_seconds, default:0]" <<
                     " [-s enable short_response, default:true]" << 
                     " [-o max_outstanding, default:1]" <<
-                    " [-u send_interval_us, default:2000]" <<
+                    " [-u batch_interval_us, default:0, intended for -f 1 -o 1]" <<
                     " [-m multiport, default:false]" << 
                     " [-D dummy, default:false]" <<
                     " [-d dump_io_stats]" << std::endl;
