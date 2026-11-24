@@ -12,8 +12,9 @@
   - 官方仓在共同祖先 `b6e64fd` 之后仅有 `LICENSE` 与 `README.md` 改动（0 行代码更新）；
   - 当前仓的数据面核心（`eBPF/*`、`eTran_posix.cc`、`eTran_rpc.cc`、`xsk_if.cc`、`xsk_buffer_pool`）除 `entrance.c` 放行 ARP 与 `tcp/main.c` 的 `barrier_var(qid)` Verifier 修复外零逻辑污染；
   - 前置 `-Q` 共享/独占队列划分（`a2f3456..a425b37`）、注册协议骨架、内核兼容性补丁与严格绑核回收机制（`c78ec15..2d2ce93`，修复文档已整理至 `docs/fixs/`）均已就绪。
-- **远端 `108-51` / `108-52` 同步前核查规范**：
-  - 远端 `/home/xhcui/repos/eTran-server` 当前 `HEAD` 位于 `da27b79`，且两端工作区可能留有早期未提交的 `control_plane.cc` 改动。执行同步前，须逐端 `git diff` 比对其与本地已提交 `f187d73` 的差异，确认来源一致并妥善备份后再快进更新。
+- **远端 `108-51` / `108-52` 同步记录**
+  - 阶段 A 同步前，两端 `/home/xhcui/repos/eTran-server` 位于 `da27b79`，并各有未提交的 `control_plane.cc` 改动。同步时逐端与 `f187d73` 比对，归档差异后快进更新。
+  - 两端的 `docs/ppt-outline-traffic-isolation.md` 与 `slides/` 均为未跟踪的本地资料，合入及同步时保留在原处。
   - 引用或复跑早期共置矩阵（如 `experiments/20261122-numa0-colocation`）结果时，明确记录其对应构建产物为 `13a7946-abi1`。
 
 ### 1.2 现阶段 NUMA 处理原则：机制一视同仁 + 实验手动框选
@@ -21,10 +22,10 @@
 为严格控制实验变量并与后期研究阶段解耦，现阶段确立以下拓扑原则：
 
 1. **代码机制层对所有 NUMA 节点一视同仁**：微内核控制面、网卡初始化、驱动解耦与创建期核心池分配器**不内置任何自动 NUMA 过滤、节点偏置或跨 Socket 代价逻辑**，池内所有可用核心平等对待。
-2. **提供微内核级“可用核池手动框选”入口**：新增启动参数/环境变量（如 `-c <cpulist>` 或 `ETRAN_CPU_POOL`，支持如 `"0,2,6,8"` 格式）：
-   - 未指定时：默认将除控制面保留核外的全部在线 CPU 一视同仁纳入可用核心池；
-   - 受限同 NUMA 实验时：通过启动参数手动将可用核池框定在同一 NUMA 节点的指定物理核子集内（既精确控制受限核数，又排除跨 NUMA 干扰）；
-   - 后期评估异 NUMA 因素时：直接调整框选列表覆盖跨 NUMA 核心进行对照测量，再在此基础上设计拓扑感知的跨节点溢出策略。
+2. **手动指定可用核池**。实验脚本统一设置微内核的环境变量 `ETRAN_CPU_POOL`，支持 CPU 列表及范围，例如 `ETRAN_CPU_POOL="0,2,6-8"`。`ETRAN_CP_CPU` 可单独指定控制面核，`ETRAN_THROUGHPUT_CPU` 和 `ETRAN_LATENCY_CPU` 分别指定吞吐和时延队列的 IRQ 核。
+   - 未设置 `ETRAN_CPU_POOL` 时，可用核池包含除控制面保留核之外的所有在线 CPU。
+   - 同 NUMA 受限核实验通过 `ETRAN_CPU_POOL` 选择同一节点的物理核子集。
+   - 跨 NUMA 对照实验通过调整同一个核池列表选择不同节点的核。
 
 ### 1.3 推荐推进顺序：先在 20 核环境验证驱动解耦，再单独解锁 24 核
 
@@ -101,6 +102,7 @@ SSH 实测核查确认：
 3. **受控扩容编译期常量、警惕 `__u8 qid2xsk` 截断并执行“成套构建部署”**
    - 分别定义清晰的编译期上界（如 `MAX_CPU = 64`、`MAXMAX_CPU = 64`、`MAX_NIC_QUEUES = 32` 或 `64`），保留现有 `MAX_APP_THREADS = 20` 不做无谓放大；运行期严格校验实际开启通道数 `_num_queues <= MAX_NIC_QUEUES` 且分配的 `qid < _num_queues`，`create_rss_context()` 按实际 `_num_queues` 生成 RSS 权重表。
    - **二进制布局与成套部署铁律**：修改 `MAX_NIC_QUEUES` 会直接改变按 `sizeof` 通信的 `register_response`（`intf.h`）、共享内存 `BufferPool`（`xsk_buffer_pool.h`）以及 `bpf_tcp_conn`（`intf_ebpf.h`）结构体大小。**每次调整头文件常量后，`micro_kernel`、`libetran.so`、全部 eBPF `.o` 与测试应用必须基于同一套头文件全量重编，并在服务端与客户端成套部署或成套回退，严禁混用新旧二进制！**
+   - **重用构建目录时先清理**。修改 `capacity.h`、`intf.h` 等公共 ABI 头文件后，在两端各自的构建目录先执行 `make -C eTran clean`，再执行 `make -C eTran` 全量编译。微内核、`shared_lib` 和四个 TCP 基准应用使用 `.d` 跟踪头文件依赖，eBPF 通过 `BPF_HEADERS` 声明头文件依赖。统一清理可避免不同子目标复用旧 ABI 的产物。
    - **记录 `qid2xsk` 8 位索引约束**：`struct bpf_tcp_conn` 中的 `__u8 qid2xsk[MAX_NIC_QUEUES]` 为 8 位无符号整数，而 `MAX_XSK_FD` 为 `1024`；若多应用/多线程规模扩大使分配的 `xsk_map_key > 255`，写入 `qid2xsk` 将发生高位截断。在当前 24 核测试规模下运行期校验 `xsk_map_key <= UINT8_MAX`，后续若大规模扩展并发度再将 `qid2xsk` 拓宽为 `__u16`。
 
 ---
