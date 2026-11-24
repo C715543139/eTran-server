@@ -133,7 +133,11 @@ static __always_inline void kick_tw(void)
         bpf_timer_set_callback(t, tw_cb);
         twt->ready = true;
     }
-    if (!bpf_timer_start(t, 0, BPF_F_TIMER_IMMEDIATE))
+    if (bpf_timer_start(t, 0, BPF_F_TIMER_IMMEDIATE))
+        return;
+    /* Preserve the index bound after the timer helpers and a stack reload. */
+    barrier_var(current_cpu);
+    if (current_cpu < MAX_CPU)
         has_kick[current_cpu] = true;
 }
 
