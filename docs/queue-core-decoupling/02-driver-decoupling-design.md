@@ -105,8 +105,8 @@
 | `6.6.0-eTran-compat2` | `etran-experiment` | `nosmt nr_cpus=20 panic=30` | 20 核阶段 A 清理基线及随时回退对照 |
 | `6.6.0-eTran-compat3` | `etran-compat3-20` | `nosmt nr_cpus=20 panic=30` | 初版驱动解耦与生命周期补丁的 20 核对照 |
 | `6.6.0-eTran-compat3.1` | `etran-compat3-1-20` | `nosmt nr_cpus=20 panic=30` | 最终补丁（`553a8e9` 补齐清池后二次网络同步）的 20 核基线复验、跨核与重绑验收 |
-| **`6.6.0-eTran-compat3.1`** | **`etran-compat3-1-24`** | **`nosmt panic=30`（解除 `nr_cpus=20`）** | **24 核容量与高核号数据面验收通过后的双端默认启动项** |
-| `6.6.0-eTran-compat3.2` | `etran-compat3-2-24` | `nosmt panic=30` | 双端一次性启动，验证 BPF 整栈卸载和重启微内核 |
+| `6.6.0-eTran-compat3.1` | `etran-compat3-1-24` | `nosmt panic=30`（解除 `nr_cpus=20`） | 24 核容量与高核号数据面验收，现为 24 核回退项 |
+| **`6.6.0-eTran-compat3.2`** | **`etran-compat3-2-24`** | **`nosmt panic=30`** | **BPF 整栈卸载的 TCP 回归通过后设为双端默认启动项** |
 
 由于补丁同时涉及 `mlx5`、`AF_XDP`、`BPF_MAP_TYPE_PKT_QUEUE` 与新增 kfunc，部署与回退时必须将 **内核、模块、eTran 用户态二进制/库与 pacing eBPF 对象**按对应版本成套切换；若回退至 `compat2`，须配套切回阶段 A（`182dd51`）的构建产物。
 
@@ -154,4 +154,4 @@
 
 复采时，52 在两种退出场景分别记录到 7,584 和 7,632 次调度与分派逐一匹配，均观察到一次定时器撤销调用和一次 RCU 回收。撤销入口未捕获已调度但尚未分派的回调，本轮 TCP 流也没有进入 pacer 队列。仍在排队时的撤销和 pacer 队列撤销留待独立验证。
 
-各用例内核日志均无新增告警。两端均恢复 24 通道、`irqbalance` active 和双向连通。GRUB 的常规启动项为 `etran-compat3-1-24`，`compat3.2` 通过一次性启动进行本轮验收。相关原始记录在 `experiments/20261124-queue-core-decoupling/` 下的 `compat32-runtime-regression` 和 `compat32-lifetime`。
+各用例内核日志均无新增告警。两端均恢复 24 通道、`irqbalance` active 和双向连通。一次性启动验收后，双端已将 GRUB 的常规启动项设为 `etran-compat3-2-24`，保留 `etran-compat3-1-24` 和 `etran-experiment` 作为回退项。相关原始记录在 `experiments/20261124-queue-core-decoupling/` 下的 `compat32-runtime-regression` 和 `compat32-lifetime`。
