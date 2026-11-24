@@ -25,10 +25,9 @@
 
 #include <base/compiler.h>
 #include <base/lock.h>
+#include <intf/capacity.h>
 #include <shm/shm_wrapper.h>
 
-/* Maximum NIC queues per buffer pool */
-#define MAX_NIC_QUEUES 20
 /* Number of frames in each UMEM */
 const unsigned int umem_num_frames = 64 * XSK_RING_PROD__DEFAULT_NUM_DESCS;
 /* Size of each frame in UMEM */

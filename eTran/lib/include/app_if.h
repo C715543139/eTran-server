@@ -17,7 +17,6 @@
 #define ETRAN_TCP_THROUGHPUT 1
 #define ETRAN_HOMA 2
 
-constexpr unsigned int MAX_APP_THREADS = 20;
 
 // size must be power of 2
 template <typename T>

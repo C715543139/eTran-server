@@ -53,7 +53,6 @@
 #define TICK_US 1000
 #include <regex>      // std::regex、std::smatch、std::regex_search
 #include <fstream>    // std::ifstream
-#define COMP_BASE 1
 
 /* Unidx domain socket for application enrollment */
 int uds_sockfd;
@@ -345,7 +344,7 @@ static void destroy_rss_context(struct app_ctx *actx)
 
 #ifdef ALLOCATION
 // 读取 /proc/stat 的每核（cpu0..）计数，跳过汇总行 "cpu"
-static bool read_cpu_times(std::vector<cpuOverheadInfo> &out) {
+static bool read_cpu_times(std::map<int, cpuOverheadInfo> &out) {
     std::ifstream fin("/proc/stat");
     if (!fin) return false;
 
@@ -357,12 +356,16 @@ static bool read_cpu_times(std::vector<cpuOverheadInfo> &out) {
         iss >> label;
         if (label == "cpu") continue;          // 跳过汇总
 
+        const char *id = label.c_str() + 3;
+        char *end;
+        long cpu = strtol(id, &end, 10);
+        if (end == id || *end || cpu < 0 || cpu >= MAX_CPU)
+            continue;
+
         cpuOverheadInfo t;
-        // 依次读取 7 个字段（老内核只保证到 softirq；guest 等可忽略）
-        iss >> t.user >> t.nice >> t.system >> t.idle >> t.iowait >> t.irq >> t.softirq;
-        out.push_back(t);      
+        if (iss >> t.user >> t.nice >> t.system >> t.idle >> t.iowait >> t.irq >> t.softirq)
+            out.emplace(cpu, t);
     }
-    assert(out.size()==MAX_CPU);
     return !out.empty();
 }
 
@@ -377,40 +380,29 @@ static inline unsigned long long sum_idle(const cpuOverheadInfo &x) {
 
 // 间隔 100ms 读取两次并计算每核使用率（百分数）
 static void get_cpu_overhead_info(void) {
-    std::vector<cpuOverheadInfo> a, b;
-    if (!read_cpu_times(a)) {
-        // 读取失败时安全置零
-        for (int i = 0; i < MAX_CPU; ++i) cpuUsage[i] = 0;
+    std::map<int, cpuOverheadInfo> a, b;
+    std::fill_n(cpuUsage, MAX_CPU, 0);
+    if (!read_cpu_times(a))
         return;
-    }
-    usleep(100000);//等待100ms之后的下一次统计
-
-    if (!read_cpu_times(b)) {
-        for (int i = 0; i < MAX_CPU; ++i) cpuUsage[i] = 0;
+    usleep(100000);
+    if (!read_cpu_times(b))
         return;
-    }
-    assert(a.size() == MAX_CPU);
-    assert(b.size() == MAX_CPU);
-    // 默认置零
-    for (int i = 0; i < MAX_CPU; ++i) cpuUsage[i] = 0;
 
-    for (size_t i = 0; i < MAX_CPU; ++i) {
-        unsigned long long ta = sum_all(a[i]);
-        unsigned long long tb = sum_all(b[i]);
-        unsigned long long ia = sum_idle(a[i]);
-        unsigned long long ib = sum_idle(b[i]);
+    for (const auto &[cpu, before] : a) {
+        auto it = b.find(cpu);
+        if (it == b.end())
+            continue;
+        const auto &after = it->second;
+        unsigned long long ta = sum_all(before);
+        unsigned long long tb = sum_all(after);
+        unsigned long long ia = sum_idle(before);
+        unsigned long long ib = sum_idle(after);
 
         unsigned long long dt = (tb > ta) ? (tb - ta) : 0ULL;
         unsigned long long di = (ib > ia) ? (ib - ia) : 0ULL;
 
-        int percent = 0;
-        if (dt > 0) {
-            // 四舍五入到整数百分比
-            percent = (int)(( (dt - di) * 100ULL + dt/2 ) / dt);
-            if (percent < 0) percent = 0;
-            if (percent > 100) percent = 100;
-        }
-        cpuUsage[i] = percent;
+        if (dt > di)
+            cpuUsage[cpu] = ((dt - di) * 100 + dt / 2) / dt;
     }
 }
 
@@ -426,20 +418,15 @@ int get_least_loaded_cpu(const std::set<int> *candidate, int *cpuId, int *cpuOve
     return (minLoad < 100) ? 0 : -1;
 }
 
-static bool valid_app_cpu(int cpu)
+static bool valid_pool_cpu(int cpu)
 {
-    if (cpu < 0 || cpu >= MAX_CPU || cpu == CP_CPU)
-        return false;
-    if (cpu == 0)
-        return true;
-    std::ifstream online("/sys/devices/system/cpu/cpu" + std::to_string(cpu) + "/online");
-    int enabled = 0;
-    return (online >> enabled) && enabled == 1;
+    const auto &pool = etran_nic->_cpu_topology.pool;
+    return std::binary_search(pool.begin(), pool.end(), cpu);
 }
 
 static int reserve_cpu(int type, CpuRole role, int cpu)
 {
-    if (!valid_app_cpu(cpu))
+    if (!valid_pool_cpu(cpu))
         return -EINVAL;
     availableCores.erase(cpu);
     if (type == LATENCY) {
@@ -552,74 +539,6 @@ static int allocate_cpu(const app_ctx *actx, CpuRole role, int requested_cpu)
     return cpu < 0 ? cpu : reserve_cpu(actx->tcp_type, role, cpu);
 }
 
-/**
- * 解析 /sys/class/net/<iface>/device -> 得到 PCI 地址 (形如 0000:03:00.1)
- */
-static std::string get_pci_addr(const std::string& iface)
-{
-    std::string cmd = "ethtool -i " + iface + " 2>/dev/null";
-    FILE* fp = popen(cmd.c_str(), "r");
-    if (!fp) assert(0);
-
-    std::array<char, 256> buf;
-    std::string line, result;
-    while (fgets(buf.data(), buf.size(), fp)) {
-        line = buf.data();
-        // 可能格式： "bus-info: 0000:03:00.1\n"
-        if (line.rfind("bus-info:", 0) == 0) {
-            // 提取冒号后的内容
-            std::string bdf = line.substr(strlen("bus-info:"));            // 跳过 "bus-info"
-            // 去掉前导/尾随空白
-            auto l = std::find_if_not(bdf.begin(), bdf.end(), ::isspace);
-            auto r = std::find_if_not(bdf.rbegin(), bdf.rend(), ::isspace).base();
-            if (l < r) result.assign(l, r);
-            break;
-        }
-    }
-    pclose(fp);
-    return result;
-}
-
-/**
- * 获取 网卡某队列 (qid, 0‑based) 对应的 IRQ 号
- * @return 成功 → IRQ 号；失败 → -1
- */
-static int get_irq_for_queue(const std::string& iface, int qid)
-{
-    std::string pci_str = get_pci_addr(iface);
-    /* comp<queue_id>@pci:<bdf> */
-    const std::string needle = "comp" + std::to_string(qid+COMP_BASE) + "@pci:" + pci_str;
-
-    /* 3. 打开 /proc/interrupts 并逐行扫描 */
-    std::ifstream fin("/proc/interrupts");
-    if (!fin) assert(0);
-
-    std::string line;
-    while (std::getline(fin, line)) {
-        /* —— 3‑1: 取该行最后一列（去掉多重空格） —— */
-        std::istringstream iss(line);
-        std::string tok, last_tok;
-        while (iss >> tok) last_tok = tok;      // 循环结束时 last_tok 为行尾单词
-
-        if (last_tok.find(needle) == std::string::npos) continue;
-
-        /* —— 3‑3: 解析 IRQ 号（行首第一列形如 "61:"） —— */
-        std::istringstream prefix(line);
-        std::string irq_field;
-        if (prefix >> irq_field && !irq_field.empty()) {
-            if (irq_field.back() == ':') irq_field.pop_back(); // 去掉冒号
-            try {
-                return std::stoi(irq_field);   // 转成整数后返回
-            } catch (...) {
-                assert(0);                     // 非法数字
-            }
-        }
-    }
-    /* 全文件都没找到 */
-    return -1;
-    
-}
-
 static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads) {
     int irq_cpu = -1;
     const char *fixed_cpu = std::getenv(actx->tcp_type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
@@ -627,28 +546,19 @@ static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::
         char *end = nullptr;
         errno = 0;
         long cpu = strtol(fixed_cpu, &end, 10);
-        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || !valid_app_cpu(cpu))
+        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || !valid_pool_cpu(cpu))
             return -EINVAL;
         irq_cpu = cpu;
     }
     if (irq_cpu < 0 || actx->requested_app_cpu < 0)
         get_cpu_overhead_info();
     for (unsigned int i = 0; i < nr_nic_queues; i++) {
-        int irq = get_irq_for_queue(etran_nic->_if_name, qids[i]);
-        if (irq < 0)
-            return -ENOENT;
         int cpu = allocate_cpu(actx, CpuRole::Irq, irq_cpu);
         if (cpu < 0)
             return cpu;
         actx->usedCores.push_back(cpu);
-        std::string path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity_list";
-        FILE *fp = fopen(path.c_str(), "w");
-        if (!fp)
-            return -errno;
-        int written = fprintf(fp, "%d\n", cpu);
-        int closed = fclose(fp);
-        if (written < 0 || closed != 0)
-            return -EIO;
+        if (int err = etran_nic->set_queue_cpu(qids[i], cpu))
+            return err;
         printf("CPU allocation pid=%d role=IRQ queue=%u cpu=%d refs=%d latency_refs=%d\n",
                actx->pid, qids[i], cpu, cpuUseRef[cpu], cpuLatUseRef[cpu]);
     }
@@ -673,6 +583,11 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
     // XXX: Homa doesn't support RSS, we can only support one Homa application with queue-level isolation
     if (actx->proto != IPPROTO_TCP)
     {
+        // Homa ingress requires the hardware queue and the CPU to match.
+        for (unsigned int qid : qids) {
+            if (int err = etran_nic->set_queue_cpu(qid, qid))
+                return err;
+        }
         cmd = "ethtool -X " + etran_nic->_if_name + " equal " + std::to_string(nr_nic_queues);
         return !exec_cmd(cmd);
     }
@@ -1092,30 +1007,28 @@ err:
 }
 
 static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, std::vector<unsigned int> &qids) {
-    qids.clear();
+    auto &free = etran_nic->_free_exclusive_qids;
+    const auto &shared = etran_nic->_shared_qids;
     switch (hint) {
     case Q_EXCLUSIVE:
-        if (etran_nic->_free_exclusive_qids.size() < nr_queues) {
+        if (free.size() < nr_queues)
             return -E2BIG;
-        }
-        for (unsigned int i=0; i<nr_queues; ++i) {
-            qids.push_back(etran_nic->_free_exclusive_qids.back());
-            etran_nic->_free_exclusive_qids.pop_back();
-        }
+        qids.assign(free.rbegin(), free.rbegin() + nr_queues);
         break;
     case Q_SHARED:
-        // nr_queues is ignored here
-        // Shared apps share all queues
-        if (etran_nic->_num_shared_queues < nr_queues) {
+        if (shared.size() < nr_queues)
             return -E2BIG;
-        }
-        for (unsigned i=0; i<nr_queues; ++i) {
-            qids.push_back(etran_nic->_shared_qids[i]);
-        }
+        qids.assign(shared.begin(), shared.begin() + nr_queues);
         break;
     default:
         return -EINVAL;
     }
+    for (unsigned int qid : qids) {
+        if (qid >= etran_nic->_num_queues)
+            return -EINVAL;
+    }
+    if (hint == Q_EXCLUSIVE)
+        free.resize(free.size() - nr_queues);
     return 0;
 }
 
@@ -1133,7 +1046,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     int tran_idx;
 
     if (req.nr_app_threads == 0 || req.nr_app_threads > MAX_APP_THREADS ||
-        req.nr_nic_queues == 0 || req.nr_nic_queues > MAX_NIC_QUEUES)
+        req.nr_nic_queues == 0 || req.nr_nic_queues > etran_nic->_num_queues)
     {
         fprintf(stderr, "alloc_app_resources: too many threads");
         return -E2BIG;
@@ -1143,7 +1056,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (req.proto == IPPROTO_TCP &&
         ((req.tcp_type != LATENCY && req.tcp_type != THROUGHPUT) ||
          requested_app_cpu < -1 ||
-         (requested_app_cpu >= 0 && !valid_app_cpu(requested_app_cpu)))) {
+         (requested_app_cpu >= 0 && !valid_pool_cpu(requested_app_cpu)))) {
         return -EINVAL;
     }
 #endif
@@ -1154,12 +1067,10 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         }
     }
 
-    if (int rc = try_allocate_queues(req.nr_nic_queues, req.queue_usage, qids)) {
-        fprintf(stderr, "Too many queues (%s:%d)\n", __func__, __LINE__);
-        return rc;
-    }
-
-    if (req.nr_nic_queues * req.nr_app_threads + req.nr_nic_queues > etran_nic->_available_xsk_keys.size())
+    auto &xsk_keys = etran_nic->_available_xsk_keys;
+    size_t data_keys = req.nr_nic_queues * req.nr_app_threads;
+    size_t total_keys = data_keys + req.nr_nic_queues;
+    if (total_keys > xsk_keys.size())
     {
         fprintf(stderr,
                 "alloc_app_resources: too many XSK keys, "
@@ -1178,6 +1089,24 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
 
     if (!actx)
         return -ENOENT;
+
+    if (req.proto == IPPROTO_TCP) {
+        // TCP's per-connection map encodes the data XSK keys as u8.
+        auto wide = std::stable_partition(xsk_keys.begin(), xsk_keys.end(),
+                                          [](int key) { return key <= UINT8_MAX; });
+        if (wide < xsk_keys.begin() + data_keys) {
+            fprintf(stderr, "Not enough TCP data XSK keys in the 8-bit range\n");
+            return -ENOSPC;
+        }
+        // Slow-path keys can use the remainder of the XSK map.
+        if (wide < xsk_keys.begin() + total_keys)
+            std::rotate(xsk_keys.begin(), wide, xsk_keys.begin() + total_keys);
+    }
+
+    if (int rc = try_allocate_queues(req.nr_nic_queues, req.queue_usage, qids)) {
+        fprintf(stderr, "Cannot allocate NIC queues: %s\n", strerror(-rc));
+        return rc;
+    }
 
     actx->proto = req.proto;
     actx->nr_nic_queues = req.nr_nic_queues;
@@ -1598,39 +1527,56 @@ static void *control_loop(void *arg)
 
 int thread_init(void)
 {
-    cpu_set_t cpu_set;
-    uds_sockfd = init_uds_ctx();
-    #ifdef ALLOCATION
-    //TODO: 初始化可用的CPU池
-    int cpuNum=sysconf(_SC_NPROCESSORS_ONLN)-1;//micro_kernel thread所在的CPU不放入池子中
+    const auto &topology = etran_nic->_cpu_topology;
+#ifdef ALLOCATION
     latUsingCores.clear();
     throughputUsingCores.clear();
     availableCores.clear();
-    for (int i=0; i<cpuNum; i++) {
-        availableCores.insert(i);
-    }
+    availableCores.insert(topology.pool.begin(), topology.pool.end());
     for (int i=0; i<MAX_CPU; i++) {
         cpuUseRef[i]=0;
         cpuLatUseRef[i]=0;
         cpuIrqRefs[i]=0;
         cpuThroughputAppRefs[i]=0;
     }
-    #endif
+#endif
 
+    uds_sockfd = init_uds_ctx();
     if (uds_sockfd < 0)
     {
         fprintf(stderr, "thread_init:init_uds_ctx failed\n");
         return -1;
     }
 
-    if (pthread_create(&micro_kernel_thread, nullptr, control_loop, nullptr) != 0)
-    {
-        fprintf(stderr, "thread_init:pthread_create failed\n");
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    CPU_SET(topology.control, &requested);
+
+    pthread_attr_t attr;
+    int err = pthread_attr_init(&attr);
+    if (err == 0) {
+        err = pthread_attr_setaffinity_np(&attr, sizeof(requested), &requested);
+        if (err == 0)
+            err = pthread_create(&micro_kernel_thread, &attr, control_loop, nullptr);
+        pthread_attr_destroy(&attr);
+    }
+    if (err != 0) {
+        fprintf(stderr, "Cannot start control plane on CPU %d: %s\n",
+                topology.control, strerror(err));
+        destroy_uds_ctx(uds_sockfd);
         return -1;
     }
-    CPU_ZERO(&cpu_set);
-    CPU_SET(CP_CPU, &cpu_set);
-    pthread_setaffinity_np(micro_kernel_thread, sizeof(cpu_set_t), &cpu_set);
+
+    cpu_set_t actual;
+    err = pthread_getaffinity_np(micro_kernel_thread, sizeof(actual), &actual);
+    if (err != 0 || !CPU_EQUAL(&requested, &actual)) {
+        fprintf(stderr, "Cannot verify control-plane affinity on CPU %d\n", topology.control);
+        pthread_cancel(micro_kernel_thread);
+        pthread_join(micro_kernel_thread, nullptr);
+        destroy_uds_ctx(uds_sockfd);
+        return -1;
+    }
+    printf("Control plane CPU: %d\n", topology.control);
 
     return 0;
 }

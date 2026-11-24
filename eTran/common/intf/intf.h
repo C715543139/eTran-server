@@ -101,7 +101,7 @@ struct register_response {
 
     #ifdef ALLOCATION
     int cpuLen;//针对throughput和latency的分配逻辑不一样
-    int cpus[MAX_NIC_QUEUES+20];//每一个网卡队列和
+    int cpus[MAX_NIC_QUEUES + MAX_APP_THREADS]; // IRQ slots followed by application threads
     #endif
 } __attribute__((packed));
 

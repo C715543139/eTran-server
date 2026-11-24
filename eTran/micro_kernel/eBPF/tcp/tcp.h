@@ -26,11 +26,7 @@
 // we use cc_idx to identify each connection
 // TODO: much more configurable
 SEC(".data.prev_conn")
-__u32 prev_conn[MAX_CPU] = {__UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-                            __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__, __UINT32_MAX__,
-};
+__u32 prev_conn[MAX_CPU] = { [0 ... MAX_CPU - 1] = NULL_CONN };
 __u32 prev_conn_li[MAX_CPU];
 __u16 prev_conn_lp[MAX_CPU];
 __u32 prev_conn_ri[MAX_CPU];

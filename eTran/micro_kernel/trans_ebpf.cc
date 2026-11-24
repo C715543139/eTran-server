@@ -1,5 +1,7 @@
 #include "trans_ebpf.h"
 
+#include <algorithm>
+
 /***************** Entrance *****************/
 int eTranEntrance::load_ebpf_programs(void)
 {
@@ -127,6 +129,19 @@ int eTranTCP::load_ebpf_programs(void)
         return err;
     }
 
+    struct bpf_map *prev_conn = bpf_object__find_map_by_name(obj, ".data.prev_conn");
+    size_t initial_size = 0;
+    const auto *initial = prev_conn ?
+        static_cast<const uint32_t *>(bpf_map__initial_value(prev_conn, &initial_size)) :
+        nullptr;
+    if (!initial || initial_size != MAX_CPU * sizeof(*initial) ||
+        !std::all_of(initial, initial + MAX_CPU,
+                     [](uint32_t value) { return value == UINT32_MAX; })) {
+        fprintf(stderr, "ERROR: TCP prev_conn must contain %d unassigned CPU slots\n", MAX_CPU);
+        bpf_object__close(obj);
+        return -EINVAL;
+    }
+
     for (size_t i = 0; i < sizeof(_tcp_bpf_progs) / sizeof(_tcp_bpf_progs[0]); i++)
     {
         _tcp_bpf_progs[i].bpf_prog = bpf_object__find_program_by_name(obj, _tcp_bpf_progs[i].name.c_str());
@@ -242,7 +257,7 @@ int eTranTCP::init_ebpf_maps(void)
         return -1;
     }
     /* install timingwheel slots */
-    for (int i = 0; i < MAX_CPU; i++)
+    for (int i : _etran_nic->_cpu_topology.online)
     {
         struct bpf_map_create_opts map_opts = {
             .sz = sizeof(map_opts),
@@ -395,7 +410,7 @@ int eTranHoma::init_ebpf_maps(void)
     }
 
     /* Install cpumap XDP programs */
-    for (int i = 0; i < MAX_CPU; i++)
+    for (int i : _etran_nic->_cpu_topology.online)
     {
         __u32 key = i;
         struct bpf_cpumap_val val = {0};

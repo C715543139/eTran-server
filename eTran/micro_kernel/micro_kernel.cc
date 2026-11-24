@@ -161,6 +161,8 @@ static int parse_mc_args(int argc, char *argv[])
                 "\t[-Q Number of shared NIC queues], default:%u\n"
                 "\t[-i Interface name], default: %s\n"
                 "\t[-p Transport protocol (tcp, homa)], default:tcp\n"
+                "\tETRAN_CPU_POOL: optional data-plane CPU list, e.g. 0,2,6-8\n"
+                "\tETRAN_CP_CPU: optional control-plane CPU, defaults to highest online ID\n"
                 "Homa options:\n"
                 "\t[-w Workload type], default:5\n"
                 "TCP options:\n"
@@ -229,6 +231,13 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Failed to parse arguments\n");
         exit(EXIT_FAILURE);
     }
+    if (opt_num_queues == 0 || opt_num_queues > MAX_NIC_QUEUES) {
+        fprintf(stderr, "-q must be between 1 and %d\n", MAX_NIC_QUEUES);
+        return EXIT_FAILURE;
+    }
+    CpuTopology topology;
+    if (!read_cpu_topology(topology))
+        return EXIT_FAILURE;
 
     /* initialize system configurations */
     if (system_init())
@@ -248,6 +257,7 @@ int main(int argc, char *argv[])
         .socket_busy_poll = opt_socket_busy_poll,
         .intr_affinity = opt_intr_affinity,
         .coalescing = opt_coalescing,
+        .cpu_topology = topology,
     };
     etran_nic = new eTranNIC(params);
     printf("[Step%d] NIC init done.\n", ++init_step);
@@ -261,6 +271,7 @@ int main(int argc, char *argv[])
     printf("[Step%d] Microkernel context init done.\n", ++init_step);
 
     /* initialize eBPF configurations */
+    int status = EXIT_FAILURE;
     if (ebpf_init())
     {
         goto err_1;
@@ -284,11 +295,12 @@ int main(int argc, char *argv[])
         nullptr);
 
     wait_thread();
+    status = EXIT_SUCCESS;
 
 err_2:
     ebpf_exit();
 err_1:
 
     printf("Micro kernel exit.\n");
-    return 0;
+    return status;
 }

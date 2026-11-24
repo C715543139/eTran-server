@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <intf/intf_ebpf.h>
+#include <runtime/cpu_topology.h>
 #include <runtime/ebpf_if.h>
 #include <utils/utils.h>
 
@@ -21,6 +22,7 @@ struct eTranNIC_init_params {
     bool socket_busy_poll;
     bool intr_affinity;
     bool coalescing;
+    CpuTopology cpu_topology;
 };
 
 class eTranNIC
@@ -44,6 +46,7 @@ public:
     bool _intr_affinity;
     /* enable coalescing */
     bool _coalescing;
+    const CpuTopology _cpu_topology;
 
     /* NIC queue information */
     nic_queue_info _nic_queues[MAX_NIC_QUEUES];
@@ -66,6 +69,7 @@ public:
         _socket_busy_poll(params.socket_busy_poll),
         _intr_affinity(params.intr_affinity),
         _coalescing(params.coalescing),
+        _cpu_topology(params.cpu_topology),
         _shared_queues_ready(false),
         _shared_bpw(nullptr)
     {
@@ -100,7 +104,10 @@ public:
         destroy_nic();
     }
 
+    int set_queue_cpu(unsigned int qid, int cpu) const;
+
 private:
+    std::string pcie_name;
     int create_nic(void);
     void destroy_nic(void);
 };

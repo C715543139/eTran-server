@@ -3,6 +3,9 @@
 #include <ifaddrs.h>
 #include <string>
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
+#include <fstream>
 
 #include <netinet/in.h>
 
@@ -32,43 +35,31 @@ static void disable_napi_polling(std::string if_name)
     printf("disable napi polling\n");
 }
 
-static int set_affinity(std::string pcie_name)
+int eTranNIC::set_queue_cpu(unsigned int qid, int cpu) const
 {
-    std::string cmd;
-    cmd = "cat /proc/interrupts | grep " + pcie_name + " | awk 'NR > 1 {print $1}' | sed 's/://'";
-    std::string res;
-    std::vector<int> irq_list;
-    exec_cmd(cmd, res);
-    if (res.empty())
-    {
-        fprintf(stderr, "Failed to get IRQ list\n");
-        return -1;
+    const auto &online = _cpu_topology.online;
+    if (qid >= _num_queues || !std::binary_search(online.begin(), online.end(), cpu))
+        return -EINVAL;
+
+    const std::string vector = "mlx5_comp" + std::to_string(qid + 1) + "@pci:" + pcie_name;
+    std::ifstream interrupts("/proc/interrupts");
+    std::string line;
+    while (std::getline(interrupts, line)) {
+        if (line.find(vector) == std::string::npos)
+            continue;
+        std::istringstream fields(line);
+        int irq;
+        if (!(fields >> irq))
+            return -EINVAL;
+        const std::string path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity_list";
+        FILE *file = fopen(path.c_str(), "w");
+        if (!file)
+            return -errno;
+        int written = fprintf(file, "%d\n", cpu);
+        int closed = fclose(file);
+        return written < 0 || closed != 0 ? -EIO : 0;
     }
-
-    std::string delimiter = "\n";
-    size_t pos = 0;
-    std::string token;
-    while ((pos = res.find(delimiter)) != std::string::npos)
-    {
-        token = res.substr(0, pos);
-        irq_list.push_back(std::stoi(token));
-        res.erase(0, pos + delimiter.length());
-    }
-
-    for (size_t cpu = 0; cpu < irq_list.size(); ++cpu)
-    {
-        int irq = irq_list[cpu];
-        std::string cmd = "echo " + std::to_string(cpu) + " > /proc/irq/" +
-                          std::to_string(irq) + "/smp_affinity_list";
-
-        if (!exec_cmd(cmd))
-        {
-            std::cerr << "Failed to configure IRQ affinity for IRQ " << irq << std::endl;
-            return -1;
-        }
-
-    }
-    return 0;
+    return -ENOENT;
 }
 
 static int check_nic(std::string if_name, unsigned int num_queues, std::string &pcie_name)
@@ -136,8 +127,6 @@ int eTranNIC::create_nic(void)
 {
     std::string cmd;
     std::string res;
-    std::string pcie_name;
-
     if (check_nic(_if_name, _num_queues, pcie_name))
         return -1;
 
@@ -167,8 +156,14 @@ int eTranNIC::create_nic(void)
             return -1;
         }
         /* set NIC interrupt affinity */
-        if (set_affinity(pcie_name))
-            return -1;
+        const auto &pool = _cpu_topology.pool;
+        for (unsigned int qid = 0; qid < _num_queues; ++qid) {
+            if (int err = set_queue_cpu(qid, pool[qid % pool.size()])) {
+                fprintf(stderr, "Failed to set affinity for queue %u: %s\n",
+                        qid, strerror(-err));
+                return -1;
+            }
+        }
     }
 
     if (!_coalescing)

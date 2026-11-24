@@ -2,6 +2,7 @@
 
 #include <string>
 
+#include <intf/capacity.h>
 #include <tran_def/homa.h>
 #include <tran_def/tcp.h>
 
@@ -21,9 +22,7 @@ const std::string ENTRANCE_BPF_OBJ_PATH = "eBPF/entrance/entrance.o";
 const std::string TCP_BPF_OBJ_PATH = "eBPF/tcp/main.o";
 const std::string HOMA_BPF_OBJ_PATH = "eBPF/homa/main.o";
 const std::string MICRO_KERNEL_SOCK_PATH = "/tmp/micro_kernel_socket";
-const unsigned int MAX_APP_THREADS = 20;
 const unsigned int MAX_SUPPORT_APP = 32;
-const unsigned int CP_CPU = 19;
 
 const int enrollment_to_ms = 0;
 const int network_to_ms = 0;
