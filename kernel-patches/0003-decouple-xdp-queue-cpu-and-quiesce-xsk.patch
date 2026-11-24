@@ -978,7 +978,7 @@ index 5001c14..de74dd3 100644
  		 * sockets, and xsk_is_bound().
  		 */
 diff --git a/net/xdp/xsk_buff_pool.c b/net/xdp/xsk_buff_pool.c
-index 2e86faf..d0dcee8 100644
+index 2e86faf..7ff3716 100644
 --- a/net/xdp/xsk_buff_pool.c
 +++ b/net/xdp/xsk_buff_pool.c
 @@ -46,6 +46,7 @@ void xp_destroy(struct xsk_buff_pool *pool)
@@ -1003,7 +1003,7 @@ index 2e86faf..d0dcee8 100644
  
  	for (i = 0; i < pool->free_heads_cnt; i++) {
  		xskb = &pool->heads[i];
-@@ -286,12 +294,27 @@ void xp_clear_dev(struct xsk_buff_pool *pool)
+@@ -286,12 +294,31 @@ void xp_clear_dev(struct xsk_buff_pool *pool)
  	if (!pool->netdev)
  		return;
  
@@ -1025,13 +1025,17 @@ index 2e86faf..d0dcee8 100644
 +	WRITE_ONCE(pool->pacing_stopped, true);
 +	synchronize_net();
 +	pkt_queue_purge_pool(pool);
++	/* A timer may have dequeued a frame while the purge was walking the
++	 * buckets. Wait for it even if the device no longer runs XSK NAPI.
++	 */
++	synchronize_net();
 +}
 +EXPORT_SYMBOL_GPL(xsk_pacing_stop);
 +
  static void xp_release_deferred(struct work_struct *work)
  {
  	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
-@@ -325,15 +348,6 @@ static void xp_release_deferred(struct work_struct *work)
+@@ -325,15 +352,6 @@ static void xp_release_deferred(struct work_struct *work)
  		printk(KERN_INFO "XDP_GEN has been unloaded.\n");
  	}
  
@@ -1047,7 +1051,7 @@ index 2e86faf..d0dcee8 100644
  	xdp_put_umem(pool->umem, false);
  	xp_destroy(pool);
  }
-@@ -425,16 +439,15 @@ void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
+@@ -425,16 +443,15 @@ void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
  	if (!pool->dma_pages)
  		return;
  
