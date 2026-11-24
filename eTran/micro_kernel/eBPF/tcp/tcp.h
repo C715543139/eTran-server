@@ -371,6 +371,10 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
         return XDP_DROP;
     }
 
+    __u32 key = cpu;
+    struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
+    bool pending = tw_map && pkt_queue_pending((struct bpf_map *)tw_map);
+
     TCP_LOCK(c);
 
     /* Timeout packet from slowpath, process it first */
@@ -461,14 +465,14 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
     // return XDP_TX;
     
     #ifdef BYPASS_RL
-    if (cc->rate >= LINK_BANDWIDTH && !nr_pkts_in_tw[cpu]) {
+    if (cc->rate >= LINK_BANDWIDTH && !pending) {
         // eRPC recommends to bypass rate limiter
         goto bypass_rl;
     }
     #endif
 
     #ifdef BYPASS_RL
-    if ((!nr_pkts_in_tw[cpu] || c->tx_sent == payload_len) && desired_tx_ts <= ref_ts) {
+    if ((!pending || c->tx_sent == payload_len) && desired_tx_ts <= ref_ts) {
         goto bypass_rl;
     }
     #endif
@@ -477,21 +481,12 @@ static __always_inline int tcp_tx_process(struct iphdr *iph, struct tcphdr *tcph
 
     // bpf_printk("cc->rate(%lu)", cc->rate);
 
-    __u32 key = cpu;
-    struct timing_wheel *tw_map = bpf_map_lookup_elem(&tw_outer_map, &key);
     if (unlikely(!tw_map)) {
         log_panic("tw_map is NULL");
         return XDP_DROP;
     }
 
-    __u32 idx = tw_insert(cpu, desired_tx_ts);
-    if (unlikely(idx == POISON_32)) {
-        log_panic("idx == POISON_32");
-        return XDP_DROP;
-    }
-    // bpf_printk("TW idx(%u), tx_ts(%lu), (%u)", idx, desired_tx_ts, cc->rate);
-
-    return bpf_redirect_map(tw_map, idx, 0);
+    return bpf_redirect_map(tw_map, tw_slot(cpu, desired_tx_ts, pending), 0);
 
 #ifdef BYPASS_RL
 bypass_rl:

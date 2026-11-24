@@ -668,7 +668,7 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
 {
     std::string cmd;
     std::string res;
-    int weight[MAX_NIC_QUEUES] = {0};
+    std::vector<int> weight(etran_nic->_num_queues);
 
     // XXX: Homa doesn't support RSS, we can only support one Homa application with queue-level isolation
     if (actx->proto != IPPROTO_TCP)
@@ -679,15 +679,17 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
 
     for (unsigned int i = 0; i < nr_nic_queues; i++)
     {
-        int qidx = qids[i];
+        unsigned int qidx = qids[i];
+        if (qidx >= weight.size())
+            return -EINVAL;
         weight[qidx] = 1;
     }
     // convert weight to string like '1 1 1 0 1 0 0'
     std::string weight_str;
-    for (unsigned int i = 0; i < MAX_NIC_QUEUES; i++)
+    for (size_t i = 0; i < weight.size(); i++)
     {
         weight_str += std::to_string(weight[i]);
-        if (i != MAX_NIC_QUEUES - 1)
+        if (i + 1 != weight.size())
             weight_str += " ";
     }
     cmd = "ethtool -X " + etran_nic->_if_name + " context new weight " + weight_str;

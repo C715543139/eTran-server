@@ -24,9 +24,6 @@
 
 SEC(".bss.front_timestamp")
 __u64 front_timestamp[MAX_CPU];
-SEC(".bss.nr_pkts_in_tw")
-__u32 nr_pkts_in_tw[MAX_CPU];
-
 struct timing_wheel {
   __uint(type, BPF_MAP_TYPE_PKT_QUEUE);
   __uint(max_entries, NR_SLOT_PER_BKT);
@@ -46,22 +43,13 @@ struct {
 SEC(".bss.has_kick")
 __u64 has_kick[MAX_CPU];
 
-// return the bucket index to insert the packet
-// POISON_32 is used to indicate an error
-static __always_inline __u32 tw_insert(__u32 cpu, __u64 ts)
+static __always_inline __u32 tw_slot(__u32 cpu, __u64 ts, bool pending)
 {
-    __u32 target_idx = POISON_32;
-    if (unlikely(cpu >= MAX_CPU)) {
-        log_panic("cpu >= MAX_CPU\n");
-        return XDP_DROP;
-    }
-    // convert timestamp to bucket index(abosulte value)
     ts = ts / SLOT_WIDTH_NS;
 
-    // initialize front_timestamp
-    if (unlikely(front_timestamp[cpu] == 0)) {
+    // Reset the cursor when this wheel gets its first packet after draining.
+    if (!pending)
         front_timestamp[cpu] = bpf_ktime_get_ns() / SLOT_WIDTH_NS;
-    }
     
     if (ts <= front_timestamp[cpu]) {
         // target time has passed, put it in the current bucket
@@ -70,41 +58,7 @@ static __always_inline __u32 tw_insert(__u32 cpu, __u64 ts)
         // target time is too far away, put it in the last bucket
         ts = front_timestamp[cpu] + MAX_BUCKETS - 1;
     }
-    // calculate the target bucket index
-    target_idx = ts % MAX_BUCKETS;
-
-    // TODO: XDP_REDIRECT fails?
-    nr_pkts_in_tw[cpu]++;
-    // bpf_printk("tw_insert: insert packet to bucket %d, front_timestamp: %lu, left_work = %lu", target_idx, front_timestamp[cpu], nr_pkts_in_tw[cpu]);
-
-    return target_idx;
-}
-
-static __always_inline bool tw_can_extract(struct bpf_map *tw_map, __u32 cpu, __u64 now)
-{
-    int ctrl_exit = 0;
-    // convert timestamp to bucket index(abosulte value)
-    now = now / SLOT_WIDTH_NS;
-
-    while (now >= front_timestamp[cpu]) {
-        // current bucket is ready to be processed
-        __u32 idx = front_timestamp[cpu] % MAX_BUCKETS;
-        
-        if (pkt_queue_empty(tw_map, idx, NULL)) {
-            // current bucket is empty
-            front_timestamp[cpu]++;
-            // bpf_printk("tw_extract: empty bucket %d, front_timestamp: %lu, left_work = %lu", idx, front_timestamp[cpu], nr_pkts_in_tw[cpu]);
-        } else {
-            // current bucket has packets
-            // bpf_printk("tw_extract: dequeue packet from bucket %d", idx);
-            return true;
-        }
-        if (++ctrl_exit >= 16) {
-            break;
-        }
-    }
-
-    return now >= front_timestamp[cpu];;
+    return ts % MAX_BUCKETS;
 }
 
 static __always_inline struct xdp_frame *tw_extract(struct bpf_map *tw_map, __u32 cpu, __u64 now, bool *cont)
@@ -117,15 +71,13 @@ static __always_inline struct xdp_frame *tw_extract(struct bpf_map *tw_map, __u3
         // current bucket is ready to be processed
         __u32 idx = front_timestamp[cpu] % MAX_BUCKETS;
         
-        if (pkt_queue_empty(tw_map, idx, NULL)) {
-            // current bucket is empty
-            front_timestamp[cpu]++;
-            // bpf_printk("tw_extract: empty bucket %d, front_timestamp: %lu, left_work = %lu", idx, front_timestamp[cpu], nr_pkts_in_tw[cpu]);
-        } else {
-            // current bucket has packets
-            // bpf_printk("tw_extract: dequeue packet from bucket %d", idx);
-            return pkt_queue_dequeue(tw_map, idx, NULL);
+        if (!pkt_queue_empty(tw_map, idx, NULL)) {
+            struct xdp_frame *frame = pkt_queue_dequeue(tw_map, idx, NULL);
+
+            if (frame)
+                return frame;
         }
+        front_timestamp[cpu]++;
         if (++ctrl_exit >= 16) {
             break;
         }
@@ -168,8 +120,6 @@ static __always_inline void kick_tw(void)
     if (has_kick[current_cpu])
         return;
 
-    has_kick[current_cpu] = true;
-
     twt = bpf_map_lookup_elem(&tw_trigger_map, &current_cpu);
     if (unlikely(!twt)) {
         log_panic("Failed to lookup tw_trigger_map");
@@ -183,9 +133,8 @@ static __always_inline void kick_tw(void)
         bpf_timer_set_callback(t, tw_cb);
         twt->ready = true;
     }
-    // kick Timing Wheel
-    // bpf_printk("kick_tw: start timer");
-    bpf_timer_start(t, 0, BPF_F_TIMER_IMMEDIATE);
+    if (!bpf_timer_start(t, 0, BPF_F_TIMER_IMMEDIATE))
+        has_kick[current_cpu] = true;
 }
 
 static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt) 
@@ -200,18 +149,19 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
     __u32 cpu = bpf_get_smp_processor_id();
     // make verifier happy
     if (unlikely(cpu >= MAX_CPU)) return 0;
-    __u64 old_v = nr_pkts_in_tw[cpu];
+    has_kick[cpu] = false;
     __u32 key = cpu;
     tw = bpf_map_lookup_elem(&tw_outer_map, &key);
     if (unlikely(!tw))
         return 0;
     tw_map = (struct bpf_map *)tw;
 
-    has_kick[cpu] = false;
-
+    if (!pkt_queue_pending(tw_map))
+        return 0;
     now = bpf_ktime_get_ns();
     
     bool cont = false;
+    bool submitted = false;
     while (1) {
         if (ctrl_exit++ >= TW_BATCH_SIZE)
             break;
@@ -223,35 +173,32 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
 
         if (unlikely(bpf_dynptr_from_xdp_frame(xdpf, 0, &ptr))) {
             log_panic("bpf_dynptr_from_xdp_frame failed");
-            break;
+            bpf_packet_drop(xdpf);
+            continue;
         }
 
         ts_opt = bpf_dynptr_slice_rdwr(&ptr, sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr),
                             NULL, sizeof(*ts_opt));
         if (unlikely(!ts_opt)) {
             log_panic("bpf_dynptr_slice_rdwr failed");
-            break;
+            bpf_packet_drop(xdpf);
+            continue;
         }
 
         ts_opt->ts_val = bpf_htonl((__u32)now);
         
         if (unlikely(bpf_packet_send(xdpf, xdpf->tx_ifindex, 0))) {
-            log_panic("bpf_packet_send failed");
-            break;
+            bpf_packet_drop(xdpf);
+            continue;
         }
-        nr_pkts_in_tw[cpu]--;
+        submitted = true;
     }
 
-    if (nr_pkts_in_tw[cpu] != old_v) {
-        // bpf_printk("Batch pkts: %lu", old_v - nr_pkts_in_tw[cpu]);
+    if (submitted)
         bpf_packet_flush();
-    }
 
-    if (nr_pkts_in_tw[cpu]) {
-        // TODO: avoid busy polling
+    if (pkt_queue_pending(tw_map))
         kick_tw();
-        // bpf_printk("kick_tw: left_work = %lu", nr_pkts_in_tw[cpu]);
-    }
 
     return 0;    
 }

@@ -1,0 +1,1069 @@
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 86f2690..a9d7580 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -493,6 +493,7 @@ struct mlx5e_xdpsq {
+ 	u16                        pc;
+ 	struct mlx5_wqe_ctrl_seg   *doorbell_cseg;
+ 	struct mlx5e_tx_mpwqe      mpwqe;
++	spinlock_t                 xmit_lock;
+ 
+ 	struct mlx5e_cq            cq;
+ 
+@@ -766,6 +767,7 @@ struct mlx5e_channel {
+ 	/* AF_XDP zero-copy */
+ 	struct mlx5e_rq            xskrq;
+ 	struct mlx5e_xdpsq         xsksq;
++	struct mlx5e_xdpsq         xsk_pace_sq;
+ 
+ 	/* Async ICOSQ */
+ 	struct mlx5e_icosq         async_icosq;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index 316b37e..b980435 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -678,8 +678,7 @@ static void mlx5e_free_xdpsq_desc(struct mlx5e_xdpsq *sq,
+ 			/* AF_XDP send */
+ 			(*xsk_frames)++;
+ 			xdpi = mlx5e_xdpi_fifo_pop(xdpi_fifo);
+-            /* Out-of-order completion */
+-            xsk_ooo_cq(sq->channel->xsksq.xsk_pool->cq, xdpi.frame.desc_addr);
++			xsk_ooo_cq(sq->xsk_pool->cq, xdpi.frame.desc_addr);
+ 			break;
+ 		default:
+ 			WARN_ON_ONCE(true);
+@@ -745,7 +744,7 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
+ 	xdp_flush_frame_bulk(&bq);
+ 
+ 	if (xsk_frames)
+-		xsk_tx_completed(sq->channel->xsksq.xsk_pool, xsk_frames);
++		xsk_tx_completed(sq->xsk_pool, xsk_frames);
+ 
+ 	sq->stats->cqes += i;
+ 
+@@ -786,137 +785,179 @@ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq)
+ 		xsk_tx_completed(sq->xsk_pool, xsk_frames);
+ }
+ 
+-int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+-		   u32 flags)
++static bool mlx5e_xmit_paced_frame(struct mlx5e_xdpsq *sq, struct xdp_frame *frame)
+ {
+-	struct mlx5e_priv *priv = netdev_priv(dev);
+-	struct mlx5e_xdpsq *sq;
+-	int nxmit = 0;
+-	int sq_num;
+-	int i;
+-
+-	/* this flag is sufficient, no need to test internal sq state */
+-	if (unlikely(!mlx5e_xdp_tx_is_enabled(priv)))
+-		return -ENETDOWN;
++	struct xsk_buff_pool *pool = frame->pool;
++	struct mlx5e_xmit_data txd = {};
++	union mlx5e_xdp_info info;
++	bool ret;
++
++	/* The pool can enter teardown after the caller has selected this SQ. */
++	if (unlikely(READ_ONCE(pool->pacing_stopped) ||
++		     READ_ONCE(sq->xsk_pool) != pool))
++		return false;
+ 
+-	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+-		return -EINVAL;
++	txd.data = frame->data;
++	txd.len = frame->len;
++	txd.dma_addr = xsk_buff_raw_get_dma(pool, frame->desc_addr);
++	xsk_buff_raw_dma_sync_for_device(pool, txd.dma_addr, txd.len);
+ 
+-	sq_num = smp_processor_id();
++	ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
++			      mlx5e_xmit_xdp_frame, sq, &txd, 0);
++	if (!ret)
++		return false;
+ 
+-	if (unlikely(sq_num >= priv->channels.num))
+-		return -ENXIO;
++	if (frame->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP) {
++		info.mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP;
++		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, info);
++	} else {
++		info.mode = MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP;
++		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, info);
++		info.frame.desc_addr = frame->desc_addr;
++		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo, info);
++	}
+ 
+-	sq = &priv->channels.c[sq_num]->xdpsq;
++	return true;
++}
+ 
+-	for (i = 0; i < n; i++) {
+-		struct mlx5e_xmit_data_frags xdptxdf = {};
+-		struct xdp_frame *xdpf = frames[i];
+-		dma_addr_t dma_arr[MAX_SKB_FRAGS];
+-		struct mlx5e_xmit_data *xdptxd;
+-		struct xsk_buff_pool *pool;
+-		bool ret;
++static bool mlx5e_xmit_redirect_frame(struct mlx5e_xdpsq *sq, struct xdp_frame *frame)
++{
++	struct mlx5e_xmit_data_frags txdf = {};
++	struct mlx5e_xmit_data *txd = &txdf.xd;
++	dma_addr_t dma_arr[MAX_SKB_FRAGS];
++	int mapped = 0;
++	bool ret;
++	int i;
+ 
+-		xdptxd = &xdptxdf.xd;
+-		xdptxd->data = xdpf->data;
+-		xdptxd->len = xdpf->len;
+-
+-		/* xsk queueing */
+-		if (xdpf->flags & XDP_FLAGS_XSK_QUEUEING) {
+-			pool = xdpf->pool;
+-			xdptxd->has_frags = 0;
+-			xdptxd->dma_addr = xsk_buff_raw_get_dma(pool, xdpf->desc_addr);
+-			xsk_buff_raw_dma_sync_for_device(pool, xdptxd->dma_addr, xdptxd->len);
+-		} else {
+-			xdptxd->has_frags = xdp_frame_has_frags(xdpf);
+-			xdptxd->dma_addr = dma_map_single(sq->pdev, xdptxd->data,
+-							xdptxd->len, DMA_TO_DEVICE);
+-			if (unlikely(dma_mapping_error(sq->pdev, xdptxd->dma_addr)))
+-				break;
+-
+-			if (xdptxd->has_frags) {
+-				int j;
++	txd->data = frame->data;
++	txd->len = frame->len;
++	txd->has_frags = xdp_frame_has_frags(frame);
++	txd->dma_addr = dma_map_single(sq->pdev, txd->data, txd->len, DMA_TO_DEVICE);
++	if (unlikely(dma_mapping_error(sq->pdev, txd->dma_addr)))
++		return false;
+ 
+-				xdptxdf.sinfo = xdp_get_shared_info_from_frame(xdpf);
+-				xdptxdf.dma_arr = dma_arr;
+-				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++) {
+-					skb_frag_t *frag = &xdptxdf.sinfo->frags[j];
+-
+-					dma_arr[j] = dma_map_single(sq->pdev, skb_frag_address(frag),
+-									skb_frag_size(frag), DMA_TO_DEVICE);
+-
+-					if (!dma_mapping_error(sq->pdev, dma_arr[j]))
+-						continue;
+-					/* mapping error */
+-					while (--j >= 0)
+-						dma_unmap_single(sq->pdev, dma_arr[j],
+-								skb_frag_size(&xdptxdf.sinfo->frags[j]),
+-								DMA_TO_DEVICE);
+-					goto out;
+-				}
+-			}
++	if (txd->has_frags) {
++		txdf.sinfo = xdp_get_shared_info_from_frame(frame);
++		txdf.dma_arr = dma_arr;
++		while (mapped < txdf.sinfo->nr_frags) {
++			skb_frag_t *frag = &txdf.sinfo->frags[mapped];
++
++			dma_arr[mapped] = dma_map_single(sq->pdev, skb_frag_address(frag),
++						        skb_frag_size(frag), DMA_TO_DEVICE);
++			if (unlikely(dma_mapping_error(sq->pdev, dma_arr[mapped])))
++				goto err_unmap;
++			mapped++;
+ 		}
++	}
+ 
+-		ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
+-				      mlx5e_xmit_xdp_frame, sq, xdptxd, 0);
++	ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
++			      mlx5e_xmit_xdp_frame, sq, txd, 0);
++	if (!ret)
++		goto err_unmap;
+ 
+-		if (unlikely(!ret)) {
+-			if (!(xdpf->flags & XDP_FLAGS_XSK_QUEUEING)) {
+-				int j;
++	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
++			     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_FRAME });
++	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
++			     (union mlx5e_xdp_info) { .frame.xdpf = frame });
++	mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
++			     (union mlx5e_xdp_info) { .frame.dma_addr = txd->dma_addr });
++	for (i = 0; i < mapped; i++)
++		mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
++				     (union mlx5e_xdp_info) { .frame.dma_addr = dma_arr[i] });
++	return true;
+ 
+-				dma_unmap_single(sq->pdev, xdptxd->dma_addr,
+-						xdptxd->len, DMA_TO_DEVICE);
+-				if (!xdptxd->has_frags)
+-					break;
+-				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
+-					dma_unmap_single(sq->pdev, dma_arr[j],
+-							skb_frag_size(&xdptxdf.sinfo->frags[j]),
+-							DMA_TO_DEVICE);
+-			}
+-			break;
+-		}
+-		if (xdpf->flags & XDP_FLAGS_XSK_QUEUEING) {
+-            /* no AF_XDP completion event */
+-            if ((xdpf->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP) ||
+-                xdpf->pool->queue_id != sq_num)
+-			    mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-				     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP });
+-            else {
+-                /* ooo AF_XDP completion event */
+-                mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-				     (union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP });
+-                mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-                     (union mlx5e_xdp_info) { .frame.desc_addr = xdpf->desc_addr });
+-            }
+-		} else {
+-			/* xmit_mode == MLX5E_XDP_XMIT_MODE_FRAME */
+-			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-						(union mlx5e_xdp_info) { .mode = MLX5E_XDP_XMIT_MODE_FRAME });
++err_unmap:
++	while (mapped--) {
++		skb_frag_t *frag = &txdf.sinfo->frags[mapped];
+ 
+-			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-						(union mlx5e_xdp_info) { .frame.xdpf = xdpf });
+-			mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-						(union mlx5e_xdp_info) { .frame.dma_addr = xdptxd->dma_addr });
+-			if (xdptxd->has_frags) {
+-				int j;
++		dma_unmap_single(sq->pdev, dma_arr[mapped], skb_frag_size(frag), DMA_TO_DEVICE);
++	}
++	dma_unmap_single(sq->pdev, txd->dma_addr, txd->len, DMA_TO_DEVICE);
++	return false;
++}
+ 
+-				for (j = 0; j < xdptxdf.sinfo->nr_frags; j++)
+-					mlx5e_xdpi_fifo_push(&sq->db.xdpi_fifo,
+-								(union mlx5e_xdp_info)
+-								{ .frame.dma_addr = dma_arr[j] });
+-			}
+-		}
+-		nxmit++;
++static struct mlx5e_xdpsq *mlx5e_get_xdp_xmit_sq(struct mlx5e_priv *priv,
++					       struct net_device *dev,
++					       struct xdp_frame *frame)
++{
++	u32 channels = priv->channels.num;
++	u32 qid;
++
++	if (frame->flags & XDP_FLAGS_XSK_QUEUEING) {
++		struct xsk_buff_pool *pool = frame->pool;
++		struct mlx5e_channel *c;
++
++		if (unlikely(!pool || READ_ONCE(pool->netdev) != dev ||
++			     READ_ONCE(pool->pacing_stopped)))
++			return NULL;
++		qid = pool->queue_id;
++		if (unlikely(qid >= channels))
++			return NULL;
++		c = priv->channels.c[qid];
++		if (!test_bit_acquire(MLX5E_CHANNEL_STATE_XSK, c->state) ||
++		    READ_ONCE(c->xsk_pace_sq.xsk_pool) != pool)
++			return NULL;
++
++		return &c->xsk_pace_sq;
+ 	}
+ 
+-out:
++	if ((frame->flags & XDP_FLAGS_FROM_GEN) && frame->queue_index < channels)
++		qid = frame->queue_index;
++	else
++		qid = smp_processor_id() % channels;
++	return &priv->channels.c[qid]->xdpsq;
++}
++
++static void mlx5e_xdp_finish_batch(struct mlx5e_xdpsq *sq)
++{
+ 	if (sq->mpwqe.wqe)
+ 		mlx5e_xdp_mpwqe_complete(sq);
+ 
+-	if (flags & XDP_XMIT_FLUSH)
+-		mlx5e_xmit_xdp_doorbell(sq);
++	/* The final DEV_MAP flush might route to a different SQ. */
++	mlx5e_xmit_xdp_doorbell(sq);
++	spin_unlock_bh(&sq->xmit_lock);
++}
++
++int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++		   u32 flags)
++{
++	struct mlx5e_priv *priv = netdev_priv(dev);
++	struct mlx5e_xdpsq *sq = NULL;
++	int i;
++
++	if (unlikely(!mlx5e_xdp_tx_is_enabled(priv) || !priv->channels.num))
++		return -ENETDOWN;
++
++	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++		return -EINVAL;
++
++	for (i = 0; i < n; i++) {
++		struct xdp_frame *frame = frames[i];
++		struct mlx5e_xdpsq *next = mlx5e_get_xdp_xmit_sq(priv, dev, frame);
++		bool ret;
++
++		if (unlikely(!next))
++			break;
++
++		if (next != sq) {
++			if (sq)
++				mlx5e_xdp_finish_batch(sq);
++			sq = next;
++			spin_lock_bh(&sq->xmit_lock);
++		}
++
++		if (frame->flags & XDP_FLAGS_XSK_QUEUEING)
++			ret = mlx5e_xmit_paced_frame(sq, frame);
++		else
++			ret = mlx5e_xmit_redirect_frame(sq, frame);
++		/* devmap owns the rejected suffix, including all CQ reservations. */
++		if (unlikely(!ret))
++			break;
++	}
++	if (sq)
++		mlx5e_xdp_finish_batch(sq);
+ 
+-	return nxmit;
++	return i;
+ }
+ 
+ void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/pool.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/pool.c
+index ebada0c..e2e754f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/pool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/pool.c
+@@ -169,6 +169,7 @@ static int mlx5e_xsk_disable_locked(struct mlx5e_priv *priv, u16 ix)
+ 	if (unlikely(!pool))
+ 		return -EINVAL;
+ 
++	xsk_pacing_stop(pool);
+ 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
+ 		goto remove_pool;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+index 36826b5..d128c8d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/setup.c
+@@ -151,12 +151,28 @@ int mlx5e_open_xsk(struct mlx5e_priv *priv, struct mlx5e_params *params,
+ 	if (unlikely(err))
+ 		goto err_close_tx_cq;
+ 
++	/* Pace on the originating channel, but keep the cross-CPU producer
++	 * separate from the direct XSK TX path. Both SQs die with the pool.
++	 */
++	err = mlx5e_open_cq(c->priv, params->tx_cq_moderation, &cparam->xdp_sq.cqp, &ccp,
++			    &c->xsk_pace_sq.cq);
++	if (unlikely(err))
++		goto err_close_tx_sq;
++	err = mlx5e_open_xdpsq(c, params, &cparam->xdp_sq, pool, &c->xsk_pace_sq, true);
++	if (unlikely(err))
++		goto err_close_pace_cq;
++
+ 	kvfree(cparam);
+ 
++	smp_mb__before_atomic();
+ 	set_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
+ 
+ 	return 0;
+ 
++err_close_pace_cq:
++	mlx5e_close_cq(&c->xsk_pace_sq.cq);
++err_close_tx_sq:
++	mlx5e_close_xdpsq(&c->xsksq);
+ err_close_tx_cq:
+ 	mlx5e_close_cq(&c->xsksq.cq);
+ 
+@@ -179,11 +195,14 @@ void mlx5e_close_xsk(struct mlx5e_channel *c)
+ 
+ 	mlx5e_close_rq(&c->xskrq);
+ 	mlx5e_close_cq(&c->xskrq.cq);
++	mlx5e_close_xdpsq(&c->xsk_pace_sq);
++	mlx5e_close_cq(&c->xsk_pace_sq.cq);
+ 	mlx5e_close_xdpsq(&c->xsksq);
+ 	mlx5e_close_cq(&c->xsksq.cq);
+ 
+ 	memset(&c->xskrq, 0, sizeof(c->xskrq));
+ 	memset(&c->xsksq, 0, sizeof(c->xsksq));
++	memset(&c->xsk_pace_sq, 0, sizeof(c->xsk_pace_sq));
+ }
+ 
+ void mlx5e_activate_xsk(struct mlx5e_channel *c)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
+index da639e1..11e4f40 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
+@@ -65,8 +65,6 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
+ 	bool work_done = true;
+ 	bool flush = false;
+ 
+-	xdpi.mode = pool->xdp_egress_prog ? MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP : MLX5E_XDP_XMIT_MODE_XSK;
+-
+ 	for (; budget; budget--) {
+ 		int check_result = INDIRECT_CALL_2(sq->xmit_xdp_frame_check,
+ 						   mlx5e_xmit_xdp_frame_check_mpwqe,
+@@ -95,8 +93,11 @@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *sq, unsigned int budget)
+             continue;
+         }
+ 
+-        if (xsk_tx_no_comp_desc(&desc))
+-            xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP;
++		if (xsk_tx_no_comp_desc(&desc))
++			xdpi.mode = MLX5E_XDP_XMIT_MODE_XSK_NO_COMP;
++		else
++			xdpi.mode = pool->xdp_egress_prog ?
++				MLX5E_XDP_XMIT_MODE_XSK_OOO_COMP : MLX5E_XDP_XMIT_MODE_XSK;
+ 
+ 		xdptxd.dma_addr = xsk_buff_raw_get_dma(pool, desc.addr);
+ 		xdptxd.data = xsk_buff_raw_get_data(pool, desc.addr);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index acb4077..f3e865d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1356,6 +1356,7 @@ static int mlx5e_alloc_xdpsq(struct mlx5e_channel *c,
+ 	sq->min_inline_mode = params->tx_min_inline_mode;
+ 	sq->hw_mtu    = MLX5E_SW2HW_MTU(params, params->sw_mtu) - ETH_FCS_LEN;
+ 	sq->xsk_pool  = xsk_pool;
++	spin_lock_init(&sq->xmit_lock);
+ 
+ 	sq->stats = sq->xsk_pool ?
+ 		&c->priv->channel_stats[c->ix]->xsksq :
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index a7d9b7c..d25b2fb 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -142,7 +142,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 
+ 	qos_sqs = rcu_dereference(c->qos_sqs);
+ 
+-	xsk_open = test_bit(MLX5E_CHANNEL_STATE_XSK, c->state);
++	xsk_open = test_bit_acquire(MLX5E_CHANNEL_STATE_XSK, c->state);
+ 
+ 	ch_stats->poll++;
+ 
+@@ -195,6 +195,8 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 				rq);
+ 	if (xsk_open) {
+ 		busy |= mlx5e_poll_xdpsq_cq(&xsksq->cq);
++		busy |= mlx5e_poll_xdpsq_cq(&c->xsk_pace_sq.cq);
++		busy_xsk |= xsk_pacing_complete(xsksq->xsk_pool, MLX5E_TX_XSK_POLL_BUDGET);
+ 		busy_xsk |= mlx5e_napi_xsk_post(xsksq, xskrq);
+ 	}
+ 
+@@ -241,6 +243,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	if (xsk_open) {
+ 		mlx5e_handle_rx_dim(xskrq);
+ 		mlx5e_cq_arm(&xsksq->cq);
++		mlx5e_cq_arm(&c->xsk_pace_sq.cq);
+ 		mlx5e_cq_arm(&xskrq->cq);
+ 	}
+ 
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index adefd00..458437e 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2317,6 +2317,7 @@ struct btf *bpf_get_btf_vmlinux(void);
+ 
+ /* Map specifics */
+ struct xdp_frame;
++struct xsk_buff_pool;
+ struct sk_buff;
+ struct bpf_dtab_netdev;
+ struct bpf_cpu_map_entry;
+@@ -2345,6 +2346,8 @@ int pkt_queue_map_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index
+ int pkt_queue_map_enqueue_front(struct bpf_map *map, struct xdp_frame *xdpf, u64 index);
+ struct xdp_frame *pkt_queue_map_dequeue(struct bpf_map *map, u64 flags, u64 *rank);
+ bool pkt_queue_map_empty(struct bpf_map *map, u64 flags, u64 *rank);
++bool pkt_queue_map_pending(struct bpf_map *map);
++void pkt_queue_purge_pool(struct xsk_buff_pool *pool);
+ 
+ /* Return map's numa specified by userspace */
+ static inline int bpf_map_attr_numa_node(const union bpf_attr *attr)
+@@ -2632,6 +2635,14 @@ static inline bool pkt_queue_map_empty(struct bpf_map *map, u64 flags, u64 *rank
+     return true;
+ }
+ 
++static inline bool pkt_queue_map_pending(struct bpf_map *map)
++{
++	return false;
++}
++
++static inline void pkt_queue_purge_pool(struct xsk_buff_pool *pool)
++{
++}
+ 
+ static inline struct bpf_prog *bpf_prog_get_type_path(const char *name,
+ 				enum bpf_prog_type type)
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index d04559a..569034f 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -78,6 +78,7 @@ enum xdp_buff_flags {
+ 						   */
+ 	XDP_FLAGS_XSK_QUEUEING = BIT(2), /* used by xdp_egress for queueing */
+     XDP_FLAGS_XSK_QUEUEING_NO_COMP = BIT(3),
++	XDP_FLAGS_FROM_GEN		= BIT(4),
+ };
+ 
+ struct xdp_buff {
+diff --git a/include/net/xdp_sock_drv.h b/include/net/xdp_sock_drv.h
+index 786795e..c95f749 100644
+--- a/include/net/xdp_sock_drv.h
++++ b/include/net/xdp_sock_drv.h
+@@ -15,6 +15,9 @@
+ #ifdef CONFIG_XDP_SOCKETS
+ 
+ void xsk_ooo_cq(struct xsk_queue *cq, u64 addr);
++void xsk_pacing_stop(struct xsk_buff_pool *pool);
++void xsk_pacing_discard(struct xdp_frame *frame);
++bool xsk_pacing_complete(struct xsk_buff_pool *pool, u32 budget);
+ void xsk_no_comp_err_cq(struct xsk_queue *cq);
+ void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries);
+ bool xsk_tx_peek_desc(struct xsk_buff_pool *pool, struct xdp_desc *desc);
+@@ -205,6 +208,19 @@ static inline void xsk_buff_raw_dma_sync_for_device(struct xsk_buff_pool *pool,
+ 
+ #else
+ 
++static inline void xsk_pacing_stop(struct xsk_buff_pool *pool)
++{
++}
++
++static inline void xsk_pacing_discard(struct xdp_frame *frame)
++{
++}
++
++static inline bool xsk_pacing_complete(struct xsk_buff_pool *pool, u32 budget)
++{
++	return false;
++}
++
+ static inline void xsk_ooo_cq(struct xsk_queue *cq, u64 addr)
+ {
+ 
+diff --git a/include/net/xsk_buff_pool.h b/include/net/xsk_buff_pool.h
+index 9cbe611..46c8de1 100644
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@ -65,6 +65,7 @@ struct xsk_buff_pool {
+     struct list_head xdp_gen_flush_node;
+ 	u32 heads_cnt;
+ 	u16 queue_id;
++	u32 bound_sockets; /* Protected by RTNL. */
+ 
+     /* XDP_GEN */
+ 	struct bpf_prog *xdp_gen_prog;
+@@ -75,6 +76,13 @@ struct xsk_buff_pool {
+ 	struct xsk_queue *fq ____cacheline_aligned_in_smp;
+ 	struct xsk_queue *cq;
+ 
++	bool pacing_stopped;
++	/* Failed pacing submissions are handed back to the pool's NAPI. */
++	u64 *pacing_completions;
++	spinlock_t pacing_completion_lock;
++	u32 pacing_completion_prod;
++	u32 pacing_completion_cons;
++
+ 	struct bpf_prog *xdp_egress_prog;
+ 	struct xdp_rxq_info rxq;
+ 	struct xdp_txq_info txq;
+diff --git a/kernel/bpf/devmap.c b/kernel/bpf/devmap.c
+index 2e43b12..bcd0333 100644
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -46,6 +46,7 @@
+  */
+ #include <linux/bpf.h>
+ #include <net/xdp.h>
++#include <net/xdp_sock_drv.h>
+ #include <linux/filter.h>
+ #include <trace/events/xdp.h>
+ #include <linux/btf_ids.h>
+@@ -398,8 +399,9 @@ static void bq_xmit_all(struct xdp_dev_bulk_queue *bq, u32 flags)
+ 	 * responsibility to free them
+ 	 */
+ 	for (i = sent; unlikely(i < to_send); i++) {
+-		// printk(KERN_INFO "ndo_xdp_xmit failed, %d", i);
+-		if (!(bq->q[i]->flags & XDP_FLAGS_XSK_QUEUEING))
++		if (bq->q[i]->flags & XDP_FLAGS_XSK_QUEUEING)
++			xsk_pacing_discard(bq->q[i]);
++		else
+ 			xdp_return_frame_rx_napi(bq->q[i]);
+ 	}
+ 
+diff --git a/kernel/bpf/pkt_queue.c b/kernel/bpf/pkt_queue.c
+index 3ae0379..28278d3 100644
+--- a/kernel/bpf/pkt_queue.c
++++ b/kernel/bpf/pkt_queue.c
+@@ -7,6 +7,7 @@
+ #include <linux/btf_ids.h>
+ #include <linux/filter.h>
+ #include <net/xdp.h>
++#include <net/xdp_sock_drv.h>
+ 
+ #define PKT_QUEUE_CREATE_FLAG_MASK \
+ 	(BPF_F_NUMA_NODE | BPF_F_ACCESS_MASK)
+@@ -21,8 +22,19 @@ struct bpf_pkt_queue {
+ 	struct bpf_map map;
+ 	struct bpf_pkt_queue_bucket *buckets;
+ 	unsigned long num_buckets;
++	atomic64_t pending;
++	struct list_head link;
+ };
+ 
++static LIST_HEAD(pkt_queue_maps);
++static DEFINE_MUTEX(pkt_queue_maps_lock);
++
++static bool pkt_queue_pool_stopped(const struct xdp_frame *frame)
++{
++	return (frame->flags & XDP_FLAGS_XSK_QUEUEING) &&
++	       READ_ONCE(frame->pool->pacing_stopped);
++}
++
+ static void fifo_item_set_next(struct xdp_frame *xdpf, void *next)
+ {
+ 	xdpf->next = next;
+@@ -69,38 +81,93 @@ static struct bpf_map *pkt_queue_alloc(union bpf_attr *attr)
+ 	}
+ 
+ 	bpf_map_init_from_attr(&fifo->map, attr);
++	atomic64_set(&fifo->pending, 0);
+ 	for (i = 0; i < fifo->num_buckets; i++) {
+ 		fifo->buckets[i].head = NULL;
+ 		fifo->buckets[i].tail = NULL;
+ 		fifo->buckets[i].elem_count = 0;
+ 		spin_lock_init(&fifo->buckets[i].lock);
+ 	}
++	mutex_lock(&pkt_queue_maps_lock);
++	list_add(&fifo->link, &pkt_queue_maps);
++	mutex_unlock(&pkt_queue_maps_lock);
+ 
+ 	return &fifo->map;
+ }
+ 
+-static void pkt_queue_purge(struct bpf_pkt_queue *fifo)
++void pkt_queue_purge_pool(struct xsk_buff_pool *pool)
+ {
+-	int i;
+-    /* Packets in BPF_MAP_TYPE_PKT_QUEUE are managed by userspace AF_XDP, don't free them here */
+-	for (i = 0; i < fifo->num_buckets; i++) {
+-		struct bpf_pkt_queue_bucket *bucket;
++	struct bpf_pkt_queue *fifo;
+ 
+-		bucket = &fifo->buckets[i];
+-        spin_lock(&bucket->lock);
+-        bucket->head = bucket->tail = NULL;
+-        bucket->elem_count = 0;
+-        spin_unlock(&bucket->lock);
++	mutex_lock(&pkt_queue_maps_lock);
++	list_for_each_entry(fifo, &pkt_queue_maps, link) {
++		unsigned long i;
++
++		if (!atomic64_read(&fifo->pending))
++			continue;
++
++		for (i = 0; i < fifo->num_buckets; i++) {
++			struct bpf_pkt_queue_bucket *bucket = &fifo->buckets[i];
++			struct xdp_frame *frame, *prev = NULL;
++			unsigned long flags;
++			u32 removed = 0;
++
++			spin_lock_irqsave(&bucket->lock, flags);
++			frame = bucket->head;
++			while (frame) {
++				struct xdp_frame *next = frame->next;
++
++				if ((frame->flags & XDP_FLAGS_XSK_QUEUEING) &&
++				    frame->pool == pool) {
++					if (prev)
++						prev->next = next;
++					else
++						bucket->head = next;
++					removed++;
++				} else {
++					prev = frame;
++				}
++				frame = next;
++			}
++			bucket->tail = prev;
++			if (removed) {
++				bucket->elem_count -= removed;
++				atomic64_sub(removed, &fifo->pending);
++			}
++			spin_unlock_irqrestore(&bucket->lock, flags);
++		}
++		cond_resched();
+ 	}
++	mutex_unlock(&pkt_queue_maps_lock);
+ }
+ 
+ static void pkt_queue_free(struct bpf_map *map)
+ {
+ 	struct bpf_pkt_queue *fifo = bpf_pkt_queue(map);
++	unsigned long i;
+ 
+ 	synchronize_rcu();
+ 
+-	pkt_queue_purge(fifo);
++	/* Serialize the final traversal with pool teardown. The map has no readers. */
++	mutex_lock(&pkt_queue_maps_lock);
++	list_del(&fifo->link);
++	rcu_read_lock();
++	for (i = 0; i < fifo->num_buckets; i++) {
++		struct xdp_frame *frame = fifo->buckets[i].head;
++
++		while (frame) {
++			struct xdp_frame *next = frame->next;
++
++			if (frame->flags & XDP_FLAGS_XSK_QUEUEING)
++				xsk_pacing_discard(frame);
++			else
++				xdp_return_frame(frame);
++			frame = next;
++		}
++	}
++	rcu_read_unlock();
++	mutex_unlock(&pkt_queue_maps_lock);
++
+ 	bpf_map_area_free(fifo->buckets);
+ 	bpf_map_area_free(fifo);
+ }
+@@ -172,6 +239,10 @@ int pkt_queue_map_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index
+ 	/* called under local_bh_disable() so no need to use irqsave variant */
+ 	spin_lock(&bucket->lock);
+ 
++	if (unlikely(pkt_queue_pool_stopped(xdpf))) {
++		err = -ESHUTDOWN;
++		goto out;
++	}
+ 	if (unlikely(bucket->elem_count >= fifo->map.max_entries))
+ 		goto out;
+ 
+@@ -184,6 +255,7 @@ int pkt_queue_map_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index
+ 	}
+ 
+ 	bucket->elem_count++;
++	atomic64_inc(&fifo->pending);
+ 	err = 0;
+ 
+ out:
+@@ -207,6 +279,10 @@ int pkt_queue_map_enqueue_front(struct bpf_map *map, struct xdp_frame *xdpf, u64
+ 
+ 	spin_lock_irqsave(&bucket->lock, lflags);
+ 
++	if (unlikely(pkt_queue_pool_stopped(xdpf))) {
++		err = -ESHUTDOWN;
++		goto out;
++	}
+ 	if (unlikely(bucket->elem_count >= fifo->map.max_entries))
+ 		goto out;
+ 
+@@ -219,6 +295,7 @@ int pkt_queue_map_enqueue_front(struct bpf_map *map, struct xdp_frame *xdpf, u64
+ 	}
+ 
+ 	bucket->elem_count++;
++	atomic64_inc(&fifo->pending);
+ 	err = 0;
+ 
+ out:
+@@ -257,6 +334,7 @@ struct xdp_frame *pkt_queue_map_dequeue(struct bpf_map *map, u64 flags, u64 *ran
+ 	fifo_item_set_next(frm, NULL);
+ 
+ 	bucket->elem_count--;
++	atomic64_dec(&fifo->pending);
+ 
+ out:
+ 	spin_unlock_irqrestore(&bucket->lock, lflags);
+@@ -276,9 +354,16 @@ bool pkt_queue_map_empty(struct bpf_map *map, u64 flags, u64 *rank)
+ 
+     bucket = &fifo->buckets[index];
+ 
+-    return !bucket->head;
++    return !READ_ONCE(bucket->head);
+ }
+ 
++bool pkt_queue_map_pending(struct bpf_map *map)
++{
++	if (map->map_type != BPF_MAP_TYPE_PKT_QUEUE)
++		return false;
++
++	return atomic64_read(&bpf_pkt_queue(map)->pending) != 0;
++}
+ static u64 pkt_queue_mem_usage(const struct bpf_map *map)
+ {
+ 	struct bpf_pkt_queue *fifo = container_of(map, struct bpf_pkt_queue, map);
+diff --git a/net/core/xdp.c b/net/core/xdp.c
+index bf65c59..462f4f3 100644
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@ -831,6 +831,11 @@ __bpf_kfunc bool pkt_queue_empty(struct bpf_map *map, u64 flags, u64 *rank)
+ 	return pkt_queue_map_empty(map, flags, rank);
+ }
+ 
++__bpf_kfunc bool pkt_queue_pending(struct bpf_map *map)
++{
++	return pkt_queue_map_pending(map);
++}
++
+ __bpf_kfunc int pkt_queue_enqueue(struct bpf_map *map, struct xdp_frame *xdpf, u64 index)
+ {
+ 	return pkt_queue_map_enqueue_front(map, xdpf, index);
+@@ -840,6 +845,10 @@ __bpf_kfunc int bpf_packet_drop(struct xdp_frame *pkt)
+ {
+ 	if (!pkt) return -EINVAL;
+ 
++	if (pkt->flags & XDP_FLAGS_XSK_QUEUEING)
++		xsk_pacing_discard(pkt);
++	else
++		xdp_return_frame(pkt);
+ 	return 0;
+ }
+ 
+@@ -855,6 +864,13 @@ __bpf_kfunc int bpf_packet_send(struct xdp_frame *pkt, int ifindex, u64 flags)
+ 	if (unlikely(!dev))
+ 		return -EINVAL;
+ 
++	if (pkt->flags & XDP_FLAGS_XSK_QUEUEING) {
++		struct xsk_buff_pool *pool = pkt->pool;
++
++		if (unlikely(READ_ONCE(pool->pacing_stopped) ||
++			     READ_ONCE(pool->netdev) != dev))
++			return -ENXIO;
++	}
+ 	return dev_xdp_enqueue(dev, pkt, dev);
+ }
+ 
+@@ -869,6 +885,7 @@ BTF_SET8_START(pkt_queue_kfunc_ids)
+ BTF_ID_FLAGS(func, pkt_queue_dequeue)
+ BTF_ID_FLAGS(func, pkt_queue_enqueue)
+ BTF_ID_FLAGS(func, pkt_queue_empty)
++BTF_ID_FLAGS(func, pkt_queue_pending)
+ BTF_ID_FLAGS(func, bpf_packet_drop)
+ BTF_ID_FLAGS(func, bpf_packet_send)
+ BTF_ID_FLAGS(func, bpf_packet_flush)
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index 5001c14..de74dd3 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -431,6 +431,7 @@ static void xdp_gen_init_page(struct page *page, void *arg)
+ 
+ 	/* initialize struct xdp_buff ctx in this page */
+ 	xdp_init_buff(ctx, PAGE_SIZE - sizeof(struct xdp_gen_page_head), &xgd->rxq);
++	ctx->flags = XDP_FLAGS_FROM_GEN;
+ 	xdp_prepare_buff(ctx, hard_start, headroom, frm_len, true);
+ 	ctx->data = ctx->data_meta + meta_len;
+ 
+@@ -600,6 +601,64 @@ void xsk_tx_completed(struct xsk_buff_pool *pool, u32 nb_entries)
+ }
+ EXPORT_SYMBOL(xsk_tx_completed);
+ 
++/* Only the pool's NAPI writes its completion ring. Failed paced sends
++ * originate on any CPU and hand the reserved address back to that NAPI.
++ */
++void xsk_pacing_discard(struct xdp_frame *frame)
++{
++	struct xsk_buff_pool *pool = frame->pool;
++	struct net_device *dev;
++	u32 prod;
++	bool queued = false;
++
++	if (frame->flags & XDP_FLAGS_XSK_QUEUEING_NO_COMP)
++		return;
++
++	spin_lock_bh(&pool->pacing_completion_lock);
++	if (unlikely(READ_ONCE(pool->pacing_stopped)))
++		goto unlock;
++
++	prod = pool->pacing_completion_prod;
++	/* Every entry here owns one reservation in this completion ring. */
++	if (WARN_ON_ONCE(prod - pool->pacing_completion_cons >= pool->cq->nentries))
++		goto unlock;
++	pool->pacing_completions[prod & pool->cq->ring_mask] = frame->desc_addr;
++	WRITE_ONCE(pool->pacing_completion_prod, prod + 1);
++	queued = true;
++unlock:
++	spin_unlock_bh(&pool->pacing_completion_lock);
++
++	if (!queued)
++		return;
++	dev = READ_ONCE(pool->netdev);
++	if (dev && dev->netdev_ops->ndo_xsk_wakeup)
++		dev->netdev_ops->ndo_xsk_wakeup(dev, pool->queue_id, XDP_WAKEUP_TX);
++}
++
++bool xsk_pacing_complete(struct xsk_buff_pool *pool, u32 budget)
++{
++	u32 cons, count, i;
++	bool pending;
++
++	if (READ_ONCE(pool->pacing_completion_cons) ==
++	    READ_ONCE(pool->pacing_completion_prod))
++		return false;
++
++	spin_lock_bh(&pool->pacing_completion_lock);
++	cons = pool->pacing_completion_cons;
++	count = min(budget, pool->pacing_completion_prod - cons);
++	for (i = 0; i < count; i++, cons++)
++		xsk_ooo_cq(pool->cq,
++			  pool->pacing_completions[cons & pool->cq->ring_mask]);
++	WRITE_ONCE(pool->pacing_completion_cons, cons);
++	pending = cons != pool->pacing_completion_prod;
++	spin_unlock_bh(&pool->pacing_completion_lock);
++
++	xsk_tx_completed(pool, count);
++	return pending;
++}
++EXPORT_SYMBOL_GPL(xsk_pacing_complete);
++
+ void xsk_tx_release(struct xsk_buff_pool *pool)
+ {
+ 	struct xdp_sock *xs;
+@@ -1308,14 +1367,21 @@ static int xsk_init_queue(u32 entries, struct xsk_queue **queue,
+ static void xsk_unbind_dev(struct xdp_sock *xs)
+ {
+ 	struct net_device *dev = xs->dev;
++	struct xsk_buff_pool *pool = xs->pool;
+ 
++	ASSERT_RTNL();
+ 	if (xs->state != XSK_BOUND)
+ 		return;
+ 	WRITE_ONCE(xs->state, XSK_UNBOUND);
+ 
+ 	/* Wait for driver to stop using the xdp socket. */
+-	xp_del_xsk(xs->pool, xs);
++	xp_del_xsk(pool, xs);
+ 	synchronize_net();
++	/* Release the queue before close returns. The socket destructor may
++	 * still defer freeing the rings and UMEM to a worker.
++	 */
++	if (!--pool->bound_sockets)
++		xp_clear_dev(pool);
+ 	dev_put(dev);
+ }
+ 
+@@ -1386,9 +1452,11 @@ static int xsk_release(struct socket *sock)
+ 	sock_prot_inuse_add(net, sk->sk_prot, -1);
+ 
+ 	xsk_delete_from_maps(xs);
++	rtnl_lock();
+ 	mutex_lock(&xs->mutex);
+ 	xsk_unbind_dev(xs);
+ 	mutex_unlock(&xs->mutex);
++	rtnl_unlock();
+ 
+ 	xskq_destroy(xs->rx);
+ 	xskq_destroy(xs->tx);
+@@ -1630,8 +1698,6 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+ 	else
+ 		xs->umem->is_our_queue[qid] = true;
+ 
+-	xp_add_xsk(xs->pool, xs);
+-
+ 	/* XDP_EGRESS */
+ 	if (xs->umem->zc && (flags & XDP_EGRESS)) {
+ 
+@@ -1682,8 +1748,12 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+ 
+ out_unlock:
+ 	if (err) {
++		if (xs->pool && !xs->pool->bound_sockets)
++			xp_clear_dev(xs->pool);
+ 		dev_put(dev);
+ 	} else {
++		xs->pool->bound_sockets++;
++		xp_add_xsk(xs->pool, xs);
+ 		/* Matches smp_rmb() in bind() for shared umem
+ 		 * sockets, and xsk_is_bound().
+ 		 */
+diff --git a/net/xdp/xsk_buff_pool.c b/net/xdp/xsk_buff_pool.c
+index 2e86faf..d0dcee8 100644
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@ -46,6 +46,7 @@ void xp_destroy(struct xsk_buff_pool *pool)
+ 	}
+ 
+ 	kvfree(pool->tx_descs);
++	kvfree(pool->pacing_completions);
+ 	kvfree(pool->heads);
+     kvfree(pool->tx_heads);
+ 	kvfree(pool);
+@@ -110,6 +111,13 @@ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
+ 
+ 	pool->fq = xs->fq_tmp;
+ 	pool->cq = xs->cq_tmp;
++	if (pool->cq) {
++		pool->pacing_completions = kvmalloc_array(pool->cq->nentries,
++						       sizeof(u64), GFP_KERNEL);
++		if (!pool->pacing_completions)
++			goto out;
++	}
++	spin_lock_init(&pool->pacing_completion_lock);
+ 
+ 	for (i = 0; i < pool->free_heads_cnt; i++) {
+ 		xskb = &pool->heads[i];
+@@ -286,12 +294,27 @@ void xp_clear_dev(struct xsk_buff_pool *pool)
+ 	if (!pool->netdev)
+ 		return;
+ 
++	xsk_pacing_stop(pool);
+ 	xp_disable_drv_zc(pool);
+ 	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id);
+ 	dev_put(pool->netdev);
+ 	pool->netdev = NULL;
+ }
+ 
++void xsk_pacing_stop(struct xsk_buff_pool *pool)
++{
++	if (READ_ONCE(pool->pacing_stopped))
++		return;
++
++	/* Stop new enqueues and submissions and wait for frames in a running
++	 * NAPI poll or NET_TX timer before removing queued frames.
++	 */
++	WRITE_ONCE(pool->pacing_stopped, true);
++	synchronize_net();
++	pkt_queue_purge_pool(pool);
++}
++EXPORT_SYMBOL_GPL(xsk_pacing_stop);
++
+ static void xp_release_deferred(struct work_struct *work)
+ {
+ 	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
+@@ -325,15 +348,6 @@ static void xp_release_deferred(struct work_struct *work)
+ 		printk(KERN_INFO "XDP_GEN has been unloaded.\n");
+ 	}
+ 
+-    /*
+-     * TODO: We should remove all frames in BPF_MAP_TYPE_PKT_QUEUE before we destroy the pool.
+-     * Here we can refer to how xsk_delete_from_maps() deletes the AF_XDP socket from all maps.
+-     * Solution:
+-     * 1) "Link" the pool with the map when first time we add a frame to the map
+-     * 2) Traverse all frames in the map and remove them here
+-     * 3) Unlink the pool with the map
+-    */
+-
+ 	xdp_put_umem(pool->umem, false);
+ 	xp_destroy(pool);
+ }
+@@ -425,16 +439,15 @@ void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
+ 	if (!pool->dma_pages)
+ 		return;
+ 
++	xsk_pacing_stop(pool);
+ 	dma_map = xp_find_dma_map(pool);
+ 	if (!dma_map) {
+ 		WARN(1, "Could not find dma_map for device");
+ 		return;
+ 	}
+ 
+-	if (!refcount_dec_and_test(&dma_map->users))
+-		return;
+-
+-	__xp_dma_unmap(dma_map, attrs);
++	if (refcount_dec_and_test(&dma_map->users))
++		__xp_dma_unmap(dma_map, attrs);
+ 	kvfree(pool->dma_pages);
+ 	pool->dma_pages = NULL;
+ 	pool->dma_pages_cnt = 0;

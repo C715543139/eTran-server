@@ -27,6 +27,7 @@ struct xdp_frame {
 extern int pkt_queue_enqueue(struct bpf_map *map, struct xdp_frame *xdp, __u64 index) __ksym;
 extern struct xdp_frame *pkt_queue_dequeue(struct bpf_map *map, __u64 flags, __u64 *rank) __ksym;
 extern bool pkt_queue_empty(struct bpf_map *map, __u64 flags, __u64 *rank) __ksym;
+extern bool pkt_queue_pending(struct bpf_map *map) __ksym;
 
 /* Operations on frame stored in BPF_MAP_TYPE_PKT_QUEUE */
 extern int bpf_dynptr_from_xdp_frame(struct xdp_frame *xdp, __u64 flags, struct bpf_dynptr *ptr__uninit) __ksym;
