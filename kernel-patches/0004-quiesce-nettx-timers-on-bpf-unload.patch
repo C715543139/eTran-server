@@ -1,0 +1,240 @@
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index f9378fb..3847a4f 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -3336,10 +3336,15 @@ static inline int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *time
+ static inline void netif_tx_schedule_bpf_timer_pacer_wakeup(void)
+ {
+ }
++
++static inline void netif_tx_cancel_bpf_timer(struct bpf_timer_nettx *timer)
++{
++}
+ #else
+ void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer);
+ int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer);
+ void netif_tx_schedule_bpf_timer_pacer_wakeup(void);
++void netif_tx_cancel_bpf_timer(struct bpf_timer_nettx *timer);
+ #endif
+ 
+ /**
+diff --git a/kernel/bpf/helpers.c b/kernel/bpf/helpers.c
+index 367bb0e..ff1cd91 100644
+--- a/kernel/bpf/helpers.c
++++ b/kernel/bpf/helpers.c
+@@ -1094,6 +1094,7 @@ const struct bpf_func_proto bpf_snprintf_proto = {
+ struct bpf_hrtimer {
+ 	struct bpf_timer_nettx net_timer;
+ 	struct hrtimer timer;
++	struct rcu_head rcu;
+ 	struct bpf_map *map;
+ 	struct bpf_prog *prog;
+ 	void __rcu *callback_fn;
+@@ -1116,8 +1117,8 @@ static DEFINE_PER_CPU(struct bpf_hrtimer *, hrtimer_running);
+ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
+ {
+ 	struct bpf_hrtimer *t = container_of(hrtimer, struct bpf_hrtimer, timer);
+-	struct bpf_map *map = t->map;
+-	void *value = t->value;
++	struct bpf_map *map;
++	void *value;
+ 	bpf_callback_t callback_fn;
+ 	void *key;
+ 	u32 idx;
+@@ -1127,6 +1128,9 @@ static enum hrtimer_restart bpf_timer_cb(struct hrtimer *hrtimer)
+ 	if (!callback_fn)
+ 		goto out;
+ 
++	map = t->map;
++	value = t->value;
++
+ 	/* bpf_timer_cb() runs in hrtimer_run_softirq. It doesn't migrate and
+ 	 * cannot be preempted by another bpf_timer_cb() on the same cpu.
+ 	 * Remember the timer this callback is servicing to prevent
+@@ -1228,6 +1232,7 @@ BPF_CALL_3(bpf_timer_init, struct bpf_timer_kern *, timer, struct bpf_map *, map
+ 	t->map = map;
+ 	t->prog = NULL;
+ 	t->is_net_timer = net_timer;
++	t->net_timer.next = NULL;
+ 	rcu_assign_pointer(t->callback_fn, NULL);
+ 	hrtimer_init(&t->timer, clockid, HRTIMER_MODE_REL_SOFT);
+ 	t->timer.function = net_timer ? bpf_timer_cb_nettx : bpf_timer_cb;
+@@ -1400,6 +1405,15 @@ static const struct bpf_func_proto bpf_timer_cancel_proto = {
+ 	.arg1_type	= ARG_PTR_TO_TIMER,
+ };
+ 
++static void bpf_nettx_timer_free_rcu(struct rcu_head *rcu)
++{
++	struct bpf_hrtimer *t = container_of(rcu, struct bpf_hrtimer, rcu);
++
++	if (t->prog)
++		bpf_prog_put(t->prog);
++	kfree(t);
++}
++
+ /* This function is called by map_delete/update_elem for individual element and
+  * by ops->map_release_uref when the user space reference to a map reaches zero.
+  */
+@@ -1417,7 +1431,10 @@ void bpf_timer_cancel_and_free(void *val)
+ 	t = timer->timer;
+ 	if (!t)
+ 		goto out;
+-	drop_prog_refcnt(t);
++	if (t->is_net_timer)
++		rcu_assign_pointer(t->callback_fn, NULL);
++	else
++		drop_prog_refcnt(t);
+ 	/* The subsequent bpf_timer_start/cancel() helpers won't be able to use
+ 	 * this timer, since it won't be initialized.
+ 	 */
+@@ -1426,6 +1443,21 @@ out:
+ 	__bpf_spin_unlock_irqrestore(&timer->lock);
+ 	if (!t)
+ 		return;
++
++	if (t->is_net_timer) {
++		/* This hrtimer only enqueues NET_TX work. Wait for it before
++		 * draining the queues so its wrapper cannot enqueue again.
++		 */
++		hrtimer_cancel(&t->timer);
++		netif_tx_cancel_bpf_timer(&t->net_timer);
++		/* A dispatcher may already have taken the timer. Keep it and
++		 * its program alive until that read-side section ends. Map
++		 * cleanup can run from the callback itself and cannot wait.
++		 */
++		call_rcu(&t->rcu, bpf_nettx_timer_free_rcu);
++		return;
++	}
++
+ 	/* Cancel the timer and wait for callback to complete if it was running.
+ 	 * If hrtimer_cancel() can be safely called it's safe to call kfree(t)
+ 	 * right after for both preallocated and non-preallocated maps.
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 360929a..6716be1 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -3201,7 +3201,7 @@ int netif_tx_schedule_bpf_timer_pacer(struct bpf_timer_nettx *timer)
+ 
+ 	spin_lock_irqsave(&bpf_pacer_lock, flags);
+ 	if (!bpf_pacer_cb)
+-		bpf_pacer_cb = timer;
++		WRITE_ONCE(bpf_pacer_cb, timer);
+ 	else
+ 		ret = -EBUSY;
+ 	spin_unlock_irqrestore(&bpf_pacer_lock, flags);
+@@ -3218,12 +3218,33 @@ void netif_tx_schedule_bpf_timer(struct bpf_timer_nettx *timer)
+ 	if (!timer->next) {
+ 		struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+ 
+-        sd->bpf_timer = timer;
++		WRITE_ONCE(sd->bpf_timer, timer);
+ 
+ 		raise_softirq_irqoff(NET_TX_SOFTIRQ);
+ 	}
+ }
+ 
++/* The caller has blocked further scheduling of this timer. The dispatchers
++ * hold a read-side critical section from dequeue through callback return.
++ */
++void netif_tx_cancel_bpf_timer(struct bpf_timer_nettx *timer)
++{
++	unsigned long flags;
++	int cpu;
++
++	for_each_possible_cpu(cpu) {
++		struct softnet_data *sd = &per_cpu(softnet_data, cpu);
++
++		if (READ_ONCE(sd->bpf_timer) == timer)
++			cmpxchg(&sd->bpf_timer, timer, NULL);
++	}
++
++	spin_lock_irqsave(&bpf_pacer_lock, flags);
++	if (bpf_pacer_cb == timer)
++		WRITE_ONCE(bpf_pacer_cb, NULL);
++	spin_unlock_irqrestore(&bpf_pacer_lock, flags);
++}
++
+ void dev_kfree_skb_irq_reason(struct sk_buff *skb, enum skb_drop_reason reason)
+ {
+ 	unsigned long flags;
+@@ -5200,19 +5221,20 @@ EXPORT_SYMBOL(netif_rx);
+ static __latent_entropy void net_tx_action(struct softirq_action *h)
+ {
+ 	struct softnet_data *sd = this_cpu_ptr(&softnet_data);
+-    struct bpf_timer_nettx *timer;
+-    int work = 0;
++	struct bpf_timer_nettx *timer;
++	int work = 0;
+ 
+-	if (sd->bpf_timer) {
++	if (READ_ONCE(sd->bpf_timer)) {
+ 		local_irq_disable();
+-        while (sd->bpf_timer) {
+-            timer = sd->bpf_timer;
+-            sd->bpf_timer = NULL;
+-            bpf_run_nettx_timers_one_st(timer);
+-            if (++work > BPF_NETTX_BUDGET)
+-                break;
+-        }
+-        local_irq_enable();
++		while (READ_ONCE(sd->bpf_timer)) {
++			timer = xchg(&sd->bpf_timer, NULL);
++			if (!timer)
++				break;
++			bpf_run_nettx_timers_one_st(timer);
++			if (++work > BPF_NETTX_BUDGET)
++				break;
++		}
++		local_irq_enable();
+ 	}
+ 
+ 	if (sd->completion_queue) {
+@@ -11498,27 +11520,22 @@ void bpf_pacer_stop(void)
+ 
+ void bpf_pacer_xmit(void)
+ {
+-	struct bpf_timer_nettx *timer = NULL;
++	struct bpf_timer_nettx *timer;
+ 	unsigned long flags;
+-	int work = 0;
++	int work;
+ 
+-	while (bpf_pacer_cb) {
++	for (work = 0; work < BPF_PACER_BUDGET && READ_ONCE(bpf_pacer_cb);
++	     work++) {
++		/* From dequeue onward the timer is only protected by RCU. */
++		local_bh_disable();
+ 		spin_lock_irqsave(&bpf_pacer_lock, flags);
+-		if (bpf_pacer_cb) {
+-			timer = bpf_pacer_cb;
+-			bpf_pacer_cb = NULL;
+-		}
++		timer = bpf_pacer_cb;
++		WRITE_ONCE(bpf_pacer_cb, NULL);
+ 		spin_unlock_irqrestore(&bpf_pacer_lock, flags);
+ 
+-		if (timer) {
+-			local_bh_disable();
++		if (timer)
+ 			bpf_run_nettx_timers_one_st(timer);
+-			local_bh_enable();
+-			work++;
+-		}
+-
+-		if (work >= BPF_PACER_BUDGET)
+-			break;
++		local_bh_enable();
+ 	}
+ }
+ 
+@@ -11538,8 +11555,8 @@ int bpf_pacer_main(void *data)
+ 			else
+ 				__set_current_state(TASK_RUNNING);
+ 		}
+-        if (!bpf_pacer_cb)
+-            cond_resched();
++		if (!READ_ONCE(bpf_pacer_cb))
++			cond_resched();
+ 	}
+ 	kthread_complete_and_exit(&bpf_pacer_done, 0);
+ }
