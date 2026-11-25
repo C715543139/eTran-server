@@ -5,7 +5,7 @@
 ## 1. 设计目标与支持范围
 
 1. TCP 的 IRQ 核可与源网卡队列号不同，IRQ 核超过已启用通道数时也能出包。
-2. 多条独占硬件队列（`Q_EXCLUSIVE`）可共用同一颗 IRQ 核，各队列的 QID、发送环和 completion ring 各自独立。本轮验收使用预先设置的静态 IRQ 亲和性，运行期在线迁核留作后续阶段验证。
+2. 多条独占硬件队列（`Q_EXCLUSIVE`）可共用同一颗 IRQ 核，各队列的 QID、发送环和 completion ring 各自独立。本轮验收使用预先设置的静态 IRQ 亲和性，运行期在线迁核见 [03-live-irq-migration-fix.md](03-live-irq-migration-fix.md)。
 3. 跨核提交、硬件发送环满和关闭 pool 都有明确的所有权移交。最后一个绑定 socket 返回后，同一 QID 可以立即绑定新 pool。
 4. 普通 XDP 重定向、AF_XDP 直接发送和 `XDP_GEN` 维持各自的发送路径。Homa 跨核与共享队列（`Q_SHARED`）的跨应用 IRQ 所有权仍需单独改造并验收：
    - **`Q_SHARED` 边界说明**：当前分配器可将同一共享 QID 分配给多个应用，而 `bind_rss_core()` 在每次应用注册时都会重新设置该 QID 的 IRQ 亲和性；若后注册应用选到不同 CPU，早先注册应用登记的 IRQ 核便会与实际亲和性失步。后续若纳入 `Q_SHARED`，须定义队列级 IRQ 所有权——新消费者继承该队列当前生效的 IRQ 放置，队列迁移时统一更新所有关联应用的登记记录（见 [control_plane.cc](../../eTran/micro_kernel/control_plane.cc) 中的 `try_allocate_queues()` 与 `bind_rss_core()`）。
@@ -155,4 +155,8 @@
 
 复采时，52 在两种退出场景分别记录到 7,584 和 7,632 次调度与分派逐一匹配，均观察到一次定时器撤销调用和一次 RCU 回收。撤销入口未捕获已调度但尚未分派的回调，本轮 TCP 流也没有进入 pacer 队列。仍在排队时的撤销和 pacer 队列撤销留待独立验证。
 
-各用例内核日志均无新增告警。两端均恢复 24 通道、`irqbalance` active 和双向连通。一次性启动验收后，双端已将 GRUB 的常规启动项设为 `etran-compat3-2-24`，保留 `etran-compat3-1-24` 和 `etran-experiment` 作为回退项。相关原始记录在 `experiments/20261124-queue-core-decoupling/` 下的 `compat32-runtime-regression` 和 `compat32-lifetime`。
+各用例内核日志均无新增告警。两端均恢复 24 通道、`irqbalance` active 和双向连通。一次性启动验收后，双端曾将 GRUB 常规启动项设为 `etran-compat3-2-24`（相关原始记录在 `experiments/20261124-queue-core-decoupling/` 下的 `compat32-runtime-regression` 和 `compat32-lifetime`）。
+
+### 6.5 `compat3.3` 运行期活跃队列 IRQ 在线交接闭环
+
+在 `compat3.2` 基础上叠加 [0005](../../kernel-patches/0005-mlx5e-use-async-icosq-for-aff-change-irq.patch) 与 [0006](../../kernel-patches/0006-handoff-deferred-napi-on-irq-affinity-change.patch) 构建 `6.6.0-eTran-compat3.3`，打通了 `napi_defer_hard_irqs` 开启状态下的通道级 NAPI 在线跨核交接与双核时间轮并发排空回收，双端默认启动项现已更新为 `etran-compat3-3-24`。完整根因剖析、状态机设计与验收数据见 [03-live-irq-migration-fix.md](03-live-irq-migration-fix.md)。
