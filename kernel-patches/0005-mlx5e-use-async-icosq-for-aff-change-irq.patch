@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eTran experiment <etran-experiment@localhost>
+Date: Wed, 25 Nov 2026 18:08:38 +0800
+Subject: [PATCH] net/mlx5e: use async ICOSQ for affinity change IRQ
+
+Backport the locked async ICOSQ wakeup from Linux 6.6.y (upstream c326f9c68921), limited to the existing affinity-change branch. Gate the kick while the asynchronous SQ is disabled.
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index d25b2fb..dce5e26 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -247,8 +247,9 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 		mlx5e_cq_arm(&xskrq->cq);
+ 	}
+ 
+-	if (unlikely(aff_change && busy_xsk)) {
+-		mlx5e_trigger_irq(&c->icosq);
++	if (unlikely(aff_change && busy_xsk) &&
++	    test_bit(MLX5E_SQ_STATE_ENABLED, &c->async_icosq.state)) {
++		mlx5e_trigger_napi_icosq(c);
+ 		ch_stats->force_irq++;
+ 	}
+ 

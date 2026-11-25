@@ -1,0 +1,575 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: eTran experiment <etran-experiment@localhost>
+Date: Wed, 25 Nov 2026 18:12:29 +0800
+Subject: [PATCH] net/mlx5e: hand off deferred NAPI after IRQ affinity changes
+
+Suppress stale watchdog callbacks atomically with the NAPI ownership transfer. Bound the async ICOSQ retry window per channel and acknowledge the move only from an effective IRQ CPU performing normal NAPI polling.
+---
+ drivers/net/ethernet/mellanox/mlx5/core/en.h  |  12 ++
+ .../net/ethernet/mellanox/mlx5/core/en_main.c |   5 +
+ .../ethernet/mellanox/mlx5/core/en_stats.c    |   3 +
+ .../ethernet/mellanox/mlx5/core/en_stats.h    |   3 +
+ .../net/ethernet/mellanox/mlx5/core/en_txrx.c | 173 ++++++++++++++++--
+ include/linux/netdevice.h                     |   4 +
+ net/core/dev.c                                | 103 ++++++++---
+ 7 files changed, 263 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index a9d7580..1a18918 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -742,6 +742,9 @@ struct mlx5e_rq {
+ 
+ enum mlx5e_channel_state {
+ 	MLX5E_CHANNEL_STATE_XSK,
++	MLX5E_CHANNEL_STATE_HANDOFF_PENDING,
++	MLX5E_CHANNEL_STATE_HANDOFF_FAILED,
++	MLX5E_CHANNEL_STATE_HANDOFF_STOP,
+ 	MLX5E_CHANNEL_NUM_STATES
+ };
+ 
+@@ -776,7 +779,14 @@ struct mlx5e_channel {
+ 
+ 	/* data path - accessed per napi poll */
+ 	const struct cpumask	  *aff_mask;
++	struct irq_data           *irq_data;
+ 	struct mlx5e_ch_stats     *stats;
++	spinlock_t                 handoff_lock;
++	struct hrtimer             handoff_timer;
++	int                        handoff_target_cpu;
++	u8                         handoff_retries;
++	bool                       handoff_irq_pending;
++	bool                       handoff_kicked;
+ 
+ 	/* control */
+ 	struct mlx5e_priv         *priv;
+@@ -1045,6 +1055,8 @@ int mlx5e_open_locked(struct net_device *netdev);
+ int mlx5e_close_locked(struct net_device *netdev);
+ 
+ void mlx5e_trigger_napi_icosq(struct mlx5e_channel *c);
++void mlx5e_handoff_init(struct mlx5e_channel *c);
++void mlx5e_handoff_stop(struct mlx5e_channel *c);
+ void mlx5e_trigger_napi_sched(struct napi_struct *napi);
+ 
+ int mlx5e_open_channels(struct mlx5e_priv *priv,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f3e865d..6557d92 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2479,6 +2479,8 @@ static int mlx5e_open_channel(struct mlx5e_priv *priv, int ix,
+ 	c->xdp      = !!params->xdp_prog;
+ 	c->stats    = &priv->channel_stats[ix]->ch;
+ 	c->aff_mask = irq_get_effective_affinity_mask(irq);
++	c->irq_data = irq_get_irq_data(irq);
++	mlx5e_handoff_init(c);
+ 	c->lag_port = mlx5e_enumerate_lag_port(priv->mdev, ix);
+ 
+ 	netif_napi_add(netdev, &c->napi, mlx5e_napi_poll);
+@@ -2524,12 +2526,15 @@ static void mlx5e_activate_channel(struct mlx5e_channel *c)
+ 		mlx5e_activate_xsk(c);
+ 	else
+ 		mlx5e_activate_rq(&c->rq);
++	clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_STOP, c->state);
+ }
+ 
+ static void mlx5e_deactivate_channel(struct mlx5e_channel *c)
+ {
+ 	int tc;
+ 
++	mlx5e_handoff_stop(c);
++
+ 	if (test_bit(MLX5E_CHANNEL_STATE_XSK, c->state))
+ 		mlx5e_deactivate_xsk(c);
+ 	else
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 4b96ad6..25db034 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -2124,6 +2124,9 @@ static const struct counter_desc ch_stats_desc[] = {
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, poll) },
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, arm) },
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, aff_change) },
++	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, aff_handoff_done) },
++	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, aff_handoff_retry) },
++	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, aff_handoff_timeout) },
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, force_irq) },
+ 	{ MLX5E_DECLARE_CH_STAT(struct mlx5e_ch_stats, eq_rearm) },
+ };
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index 477c547..2dd0b5e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -451,6 +451,9 @@ struct mlx5e_ch_stats {
+ 	u64 poll;
+ 	u64 arm;
+ 	u64 aff_change;
++	u64 aff_handoff_done;
++	u64 aff_handoff_retry;
++	u64 aff_handoff_timeout;
+ 	u64 force_irq;
+ 	u64 eq_rearm;
+ };
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+index dce5e26..b4e41ae 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_txrx.c
+@@ -39,12 +39,8 @@
+ #include "en/xsk/tx.h"
+ #include "en_accel/ktls_txrx.h"
+ 
+-static inline bool mlx5e_channel_no_affinity_change(struct mlx5e_channel *c)
+-{
+-	int current_cpu = smp_processor_id();
+-
+-	return cpumask_test_cpu(current_cpu, c->aff_mask);
+-}
++#define MLX5E_HANDOFF_INTERVAL_MS 1
++#define MLX5E_HANDOFF_MAX_RETRIES 50
+ 
+ static void mlx5e_handle_tx_dim(struct mlx5e_txqsq *sq)
+ {
+@@ -85,6 +81,142 @@ void mlx5e_trigger_irq(struct mlx5e_icosq *sq)
+ 	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &nopwqe->ctrl);
+ }
+ 
++/* handoff_lock serializes the retry timer with poll and channel shutdown. */
++static void mlx5e_trigger_handoff_icosq(struct mlx5e_channel *c)
++{
++	struct mlx5e_icosq *sq = &c->async_icosq;
++
++	if (c->handoff_kicked)
++		return;
++
++	spin_lock_bh(&c->async_icosq_lock);
++	/* Leave room for the ordinary XSK wakeup and reserved WQEs. */
++	if (test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state) &&
++	    mlx5e_wqc_has_room_for(&sq->wq, READ_ONCE(sq->cc), sq->pc,
++				  sq->reserved_room + 2)) {
++		mlx5e_trigger_irq(sq);
++		c->handoff_kicked = true;
++		c->stats->force_irq++;
++	}
++	spin_unlock_bh(&c->async_icosq_lock);
++}
++
++static enum hrtimer_restart mlx5e_handoff_timer_cb(struct hrtimer *timer)
++{
++	struct mlx5e_channel *c = container_of(timer, struct mlx5e_channel,
++					       handoff_timer);
++	enum hrtimer_restart next = HRTIMER_NORESTART;
++
++	spin_lock_bh(&c->handoff_lock);
++	if (test_bit(MLX5E_CHANNEL_STATE_HANDOFF_STOP, c->state) ||
++	    napi_disable_pending(&c->napi) ||
++	    !test_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state))
++		goto unlock;
++
++	c->handoff_kicked = false;
++	if (++c->handoff_retries >= MLX5E_HANDOFF_MAX_RETRIES) {
++		clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state);
++		set_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state);
++		c->stats->aff_handoff_timeout++;
++		netdev_warn(c->netdev,
++			    "NAPI handoff timed out for channel %d (CPU %d)\n",
++			    c->ix, c->handoff_target_cpu);
++		/* Keep data moving on the fallback CPU. A later poll can
++		 * resume normal service there or see a different route.
++		 * The normal NAPI completion path can resume the watchdog.
++		 */
++		mlx5e_trigger_handoff_icosq(c);
++		napi_schedule(&c->napi);
++		goto unlock;
++	}
++
++	c->stats->aff_handoff_retry++;
++	if (!test_bit(NAPI_STATE_SCHED, &c->napi.state))
++		mlx5e_trigger_handoff_icosq(c);
++	hrtimer_forward_now(timer, ms_to_ktime(MLX5E_HANDOFF_INTERVAL_MS));
++	next = HRTIMER_RESTART;
++unlock:
++	spin_unlock_bh(&c->handoff_lock);
++	return next;
++}
++
++void mlx5e_handoff_init(struct mlx5e_channel *c)
++{
++	spin_lock_init(&c->handoff_lock);
++	hrtimer_init(&c->handoff_timer, CLOCK_MONOTONIC,
++		     HRTIMER_MODE_REL_PINNED_SOFT);
++	c->handoff_timer.function = mlx5e_handoff_timer_cb;
++	set_bit(MLX5E_CHANNEL_STATE_HANDOFF_STOP, c->state);
++}
++
++void mlx5e_handoff_stop(struct mlx5e_channel *c)
++{
++	spin_lock_bh(&c->handoff_lock);
++	set_bit(MLX5E_CHANNEL_STATE_HANDOFF_STOP, c->state);
++	clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state);
++	clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state);
++	spin_unlock_bh(&c->handoff_lock);
++	hrtimer_cancel(&c->handoff_timer);
++}
++
++static bool mlx5e_handoff_poll(struct mlx5e_channel *c)
++{
++	bool irq_pending, on_target, handoff = false;
++	int cpu = smp_processor_id();
++	int target;
++
++	/* A threaded NAPI's CPU is chosen by the scheduler. */
++	if (READ_ONCE(c->napi.state) & (NAPIF_STATE_THREADED |
++				       NAPIF_STATE_NPSVC | NAPIF_STATE_IN_BUSY_POLL))
++		return false;
++
++	irq_pending = c->irq_data && irqd_is_setaffinity_pending(c->irq_data);
++	if (likely(!irq_pending && cpumask_test_cpu(cpu, c->aff_mask)) &&
++	    !test_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state) &&
++	    !test_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state))
++		return false;
++
++	spin_lock_bh(&c->handoff_lock);
++	if (test_bit(MLX5E_CHANNEL_STATE_HANDOFF_STOP, c->state))
++		goto unlock;
++
++	irq_pending = c->irq_data && irqd_is_setaffinity_pending(c->irq_data);
++	target = cpumask_first(c->aff_mask);
++	on_target = !irq_pending && cpumask_test_cpu(cpu, c->aff_mask);
++	if (on_target) {
++		clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state);
++		if (test_and_clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING,
++				       c->state)) {
++			hrtimer_try_to_cancel(&c->handoff_timer);
++			c->stats->aff_handoff_done++;
++		}
++		goto unlock;
++	}
++
++	if (target != c->handoff_target_cpu ||
++	    irq_pending != c->handoff_irq_pending) {
++		clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state);
++		clear_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state);
++	}
++	if (test_bit(MLX5E_CHANNEL_STATE_HANDOFF_FAILED, c->state))
++		goto unlock;
++
++	if (!test_and_set_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state)) {
++		c->handoff_target_cpu = target;
++		c->handoff_irq_pending = irq_pending;
++		c->handoff_retries = 0;
++		c->handoff_kicked = false;
++		c->stats->aff_change++;
++		hrtimer_start(&c->handoff_timer,
++			      ms_to_ktime(MLX5E_HANDOFF_INTERVAL_MS),
++			      HRTIMER_MODE_REL_PINNED_SOFT);
++	}
++	handoff = true;
++unlock:
++	spin_unlock_bh(&c->handoff_lock);
++	return handoff;
++}
++
+ static bool mlx5e_napi_xsk_post(struct mlx5e_xdpsq *xsksq, struct mlx5e_rq *xskrq)
+ {
+ 	bool need_wakeup = xsk_uses_need_wakeup(xskrq->xsk_pool);
+@@ -131,6 +263,7 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 	struct mlx5e_rq *xskrq = &c->xskrq;
+ 	struct mlx5e_rq *rq = &c->rq;
+ 	bool aff_change = false;
++	bool missed;
+ 	bool busy_xsk = false;
+ 	bool busy = false;
+ 	int work_done = 0;
+@@ -202,19 +335,19 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 
+ 	busy |= busy_xsk;
+ 
+-	if (busy) {
+-		if (likely(mlx5e_channel_no_affinity_change(c))) {
++	if (unlikely(mlx5e_handoff_poll(c))) {
++		if (!napi_complete_aff_change(napi, &missed)) {
+ 			work_done = budget;
+ 			goto out;
+ 		}
+-		ch_stats->aff_change++;
+ 		aff_change = true;
+-		if (work_done == budget)
+-			work_done--;
+-	}
+-
+-	if (unlikely(!napi_complete_done(napi, work_done)))
++		work_done = min(work_done, budget - 1);
++	} else if (busy) {
++		work_done = budget;
++		goto out;
++	} else if (unlikely(!napi_complete_done(napi, work_done))) {
+ 		goto out;
++	}
+ 
+ 	ch_stats->arm++;
+ 
+@@ -247,10 +380,14 @@ int mlx5e_napi_poll(struct napi_struct *napi, int budget)
+ 		mlx5e_cq_arm(&xskrq->cq);
+ 	}
+ 
+-	if (unlikely(aff_change && busy_xsk) &&
+-	    test_bit(MLX5E_SQ_STATE_ENABLED, &c->async_icosq.state)) {
+-		mlx5e_trigger_napi_icosq(c);
+-		ch_stats->force_irq++;
++	if (unlikely(aff_change)) {
++		/* Also kick when the old poll consumed a MISSED request or
++		 * completed a short batch: there may be no later CQ event.
++		 */
++		spin_lock_bh(&c->handoff_lock);
++		if (test_bit(MLX5E_CHANNEL_STATE_HANDOFF_PENDING, c->state))
++			mlx5e_trigger_handoff_icosq(c);
++		spin_unlock_bh(&c->handoff_lock);
+ 	}
+ 
+ out:
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 3847a4f..fdbb5be 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -378,6 +378,7 @@ struct napi_struct {
+ 	int			rx_count; /* length of rx_list */
+ 	unsigned int		napi_id;
+ 	struct hrtimer		timer;
++	raw_spinlock_t		watchdog_lock;
+ 	struct task_struct	*thread;
+ 	/* control-path-only fields follow */
+ 	struct list_head	dev_list;
+@@ -395,6 +396,7 @@ enum {
+ 	NAPI_STATE_PREFER_BUSY_POLL,	/* prefer busy-polling over softirq processing*/
+ 	NAPI_STATE_THREADED,		/* The poll is performed inside its own thread*/
+ 	NAPI_STATE_SCHED_THREADED,	/* Napi is currently scheduled in threaded mode */
++	NAPI_STATE_SUPPRESS_WATCHDOG,	/* Releasing NAPI to a new IRQ CPU */
+ };
+ 
+ enum {
+@@ -408,6 +410,7 @@ enum {
+ 	NAPIF_STATE_PREFER_BUSY_POLL	= BIT(NAPI_STATE_PREFER_BUSY_POLL),
+ 	NAPIF_STATE_THREADED		= BIT(NAPI_STATE_THREADED),
+ 	NAPIF_STATE_SCHED_THREADED	= BIT(NAPI_STATE_SCHED_THREADED),
++	NAPIF_STATE_SUPPRESS_WATCHDOG	= BIT(NAPI_STATE_SUPPRESS_WATCHDOG),
+ };
+ 
+ enum gro_result {
+@@ -530,6 +533,7 @@ static inline bool napi_reschedule(struct napi_struct *napi)
+  * Return false if device should avoid rearming interrupts.
+  */
+ bool napi_complete_done(struct napi_struct *n, int work_done);
++bool napi_complete_aff_change(struct napi_struct *n, bool *missed);
+ 
+ static inline bool napi_complete(struct napi_struct *n)
+ {
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 6716be1..415bf9a 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -6182,9 +6182,12 @@ void __napi_schedule_irqoff(struct napi_struct *n)
+ }
+ EXPORT_SYMBOL(__napi_schedule_irqoff);
+ 
+-bool napi_complete_done(struct napi_struct *n, int work_done)
++static bool __napi_complete_done(struct napi_struct *n, int work_done,
++				 bool *handoff_missed)
+ {
+-	unsigned long flags, val, new, timeout = 0;
++	bool handoff = handoff_missed != NULL;
++	bool suppressed, lock_watchdog, resume_watchdog = false;
++	unsigned long flags, watchdog_flags = 0, val, new, timeout = 0;
+ 	bool ret = true;
+ 
+ 	/*
+@@ -6197,7 +6200,10 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
+ 				 NAPIF_STATE_IN_BUSY_POLL)))
+ 		return false;
+ 
+-	if (work_done) {
++	suppressed = test_bit(NAPI_STATE_SUPPRESS_WATCHDOG, &n->state);
++	if (handoff) {
++		n->defer_hard_irqs_count = 0;
++	} else if (work_done) {
+ 		if (n->gro_bitmask)
+ 			timeout = READ_ONCE(n->dev->gro_flush_timeout);
+ 		n->defer_hard_irqs_count = READ_ONCE(n->dev->napi_defer_hard_irqs);
+@@ -6213,7 +6219,7 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
+ 		 * it, we need to bound somehow the time packets are kept in
+ 		 * the GRO layer
+ 		 */
+-		napi_gro_flush(n, !!timeout);
++		napi_gro_flush(n, !suppressed && !!timeout);
+ 	}
+ 
+ 	gro_normal_list(n);
+@@ -6226,6 +6232,23 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
+ 	}
+ 	WRITE_ONCE(n->list_owner, -1);
+ 
++	/* Serialize a timer arm at the tail of the previous poll against
++	 * cancellation by the next owner. Cancel before releasing SCHED so
++	 * the old owner cannot cancel the next owner's timer.
++	 */
++	lock_watchdog = timeout || handoff || suppressed;
++	if (lock_watchdog)
++		raw_spin_lock_irqsave(&n->watchdog_lock, watchdog_flags);
++	if (handoff) {
++		hrtimer_try_to_cancel(&n->timer);
++	} else if (suppressed) {
++		resume_watchdog = hrtimer_try_to_cancel(&n->timer) >= 0;
++		if (!resume_watchdog) {
++			timeout = 0;
++			ret = true;
++		}
++	}
++
+ 	val = READ_ONCE(n->state);
+ 	do {
+ 		WARN_ON_ONCE(!(val & NAPIF_STATE_SCHED));
+@@ -6234,26 +6257,49 @@ bool napi_complete_done(struct napi_struct *n, int work_done)
+ 			      NAPIF_STATE_SCHED_THREADED |
+ 			      NAPIF_STATE_PREFER_BUSY_POLL);
+ 
+-		/* If STATE_MISSED was set, leave STATE_SCHED set,
+-		 * because we will call napi->poll() one more time.
+-		 * This C code was suggested by Alexander Duyck to help gcc.
+-		 */
+-		new |= (val & NAPIF_STATE_MISSED) / NAPIF_STATE_MISSED *
+-						    NAPIF_STATE_SCHED;
++		if (handoff) {
++			new |= NAPIF_STATE_SUPPRESS_WATCHDOG;
++		} else {
++			if (resume_watchdog)
++				new &= ~NAPIF_STATE_SUPPRESS_WATCHDOG;
++			/* Keep scheduled when the ordinary poll must run again. */
++			new |= (val & NAPIF_STATE_MISSED) / NAPIF_STATE_MISSED *
++							NAPIF_STATE_SCHED;
++		}
+ 	} while (!try_cmpxchg(&n->state, &val, new));
+ 
++	if (timeout && !(val & NAPIF_STATE_MISSED))
++		hrtimer_start(&n->timer, ns_to_ktime(timeout),
++			      HRTIMER_MODE_REL_PINNED);
++	if (lock_watchdog)
++		raw_spin_unlock_irqrestore(&n->watchdog_lock, watchdog_flags);
++
++	if (handoff) {
++		/* The driver is responsible for kicking the new owner. */
++		*handoff_missed = !!(val & NAPIF_STATE_MISSED);
++		return true;
++	}
++
+ 	if (unlikely(val & NAPIF_STATE_MISSED)) {
+ 		__napi_schedule(n);
+ 		return false;
+ 	}
+ 
+-	if (timeout)
+-		hrtimer_start(&n->timer, ns_to_ktime(timeout),
+-			      HRTIMER_MODE_REL_PINNED);
+ 	return ret;
+ }
++
++bool napi_complete_done(struct napi_struct *n, int work_done)
++{
++	return __napi_complete_done(n, work_done, NULL);
++}
+ EXPORT_SYMBOL(napi_complete_done);
+ 
++bool napi_complete_aff_change(struct napi_struct *n, bool *missed)
++{
++	return __napi_complete_done(n, 0, missed);
++}
++EXPORT_SYMBOL_GPL(napi_complete_aff_change);
++
+ /* must be called under rcu_read_lock(), as we dont take a reference */
+ static struct napi_struct *napi_by_id(unsigned int napi_id)
+ {
+@@ -6292,7 +6338,7 @@ static void busy_poll_stop(struct napi_struct *napi, void *have_poll_lock, bool
+ 			   u16 budget)
+ {
+ 	bool skip_schedule = false;
+-	unsigned long timeout;
++	unsigned long flags, timeout;
+ 	int rc;
+ 
+ 	/* Busy polling means there is a high chance device driver hard irq
+@@ -6312,8 +6358,11 @@ static void busy_poll_stop(struct napi_struct *napi, void *have_poll_lock, bool
+ 	if (prefer_busy_poll) {
+ 		napi->defer_hard_irqs_count = READ_ONCE(napi->dev->napi_defer_hard_irqs);
+ 		timeout = READ_ONCE(napi->dev->gro_flush_timeout);
+-		if (napi->defer_hard_irqs_count && timeout) {
++		if (napi->defer_hard_irqs_count && timeout &&
++		    !test_bit(NAPI_STATE_SUPPRESS_WATCHDOG, &napi->state)) {
++			raw_spin_lock_irqsave(&napi->watchdog_lock, flags);
+ 			hrtimer_start(&napi->timer, ns_to_ktime(timeout), HRTIMER_MODE_REL_PINNED);
++			raw_spin_unlock_irqrestore(&napi->watchdog_lock, flags);
+ 			skip_schedule = true;
+ 		}
+ 	}
+@@ -6450,17 +6499,21 @@ static void napi_hash_del(struct napi_struct *napi)
+ static enum hrtimer_restart napi_watchdog(struct hrtimer *timer)
+ {
+ 	struct napi_struct *napi;
++	unsigned long val, new;
+ 
+ 	napi = container_of(timer, struct napi_struct, timer);
+ 
+ 	/* Note : we use a relaxed variant of napi_schedule_prep() not setting
+ 	 * NAPI_STATE_MISSED, since we do not react to a device IRQ.
+ 	 */
+-	if (!napi_disable_pending(napi) &&
+-	    !test_and_set_bit(NAPI_STATE_SCHED, &napi->state)) {
+-		clear_bit(NAPI_STATE_PREFER_BUSY_POLL, &napi->state);
+-		__napi_schedule_irqoff(napi);
+-	}
++	val = READ_ONCE(napi->state);
++	do {
++		if (val & (NAPIF_STATE_DISABLE | NAPIF_STATE_SCHED |
++			   NAPIF_STATE_SUPPRESS_WATCHDOG))
++			return HRTIMER_NORESTART;
++		new = (val | NAPIF_STATE_SCHED) & ~NAPIF_STATE_PREFER_BUSY_POLL;
++	} while (!try_cmpxchg(&napi->state, &val, new));
++	__napi_schedule_irqoff(napi);
+ 
+ 	return HRTIMER_NORESTART;
+ }
+@@ -6526,6 +6579,7 @@ void netif_napi_add_weight(struct net_device *dev, struct napi_struct *napi,
+ 	INIT_HLIST_NODE(&napi->napi_hash_node);
+ 	hrtimer_init(&napi->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL_PINNED);
+ 	napi->timer.function = napi_watchdog;
++	raw_spin_lock_init(&napi->watchdog_lock);
+ 	init_gro_hash(napi);
+ 	napi->skb = NULL;
+ 	INIT_LIST_HEAD(&napi->rx_list);
+@@ -6556,7 +6610,7 @@ EXPORT_SYMBOL(netif_napi_add_weight);
+ 
+ void napi_disable(struct napi_struct *n)
+ {
+-	unsigned long val, new;
++	unsigned long flags, val, new;
+ 
+ 	might_sleep();
+ 	set_bit(NAPI_STATE_DISABLE, &n->state);
+@@ -6572,7 +6626,11 @@ void napi_disable(struct napi_struct *n)
+ 		new &= ~(NAPIF_STATE_THREADED | NAPIF_STATE_PREFER_BUSY_POLL);
+ 	} while (!try_cmpxchg(&n->state, &val, new));
+ 
++	/* The previous owner can still be arming the watchdog. */
++	raw_spin_lock_irqsave(&n->watchdog_lock, flags);
++	raw_spin_unlock_irqrestore(&n->watchdog_lock, flags);
+ 	hrtimer_cancel(&n->timer);
++	clear_bit(NAPI_STATE_SUPPRESS_WATCHDOG, &n->state);
+ 
+ 	clear_bit(NAPI_STATE_DISABLE, &n->state);
+ }
+@@ -6592,7 +6650,8 @@ void napi_enable(struct napi_struct *n)
+ 	do {
+ 		BUG_ON(!test_bit(NAPI_STATE_SCHED, &val));
+ 
+-		new = val & ~(NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC);
++		new = val & ~(NAPIF_STATE_SCHED | NAPIF_STATE_NPSVC |
++			      NAPIF_STATE_SUPPRESS_WATCHDOG);
+ 		if (n->dev->threaded && n->thread)
+ 			new |= NAPIF_STATE_THREADED;
+ 	} while (!try_cmpxchg(&n->state, &val, new));
