@@ -35,31 +35,74 @@ static void disable_napi_polling(std::string if_name)
     printf("disable napi polling\n");
 }
 
-int eTranNIC::set_queue_cpu(unsigned int qid, int cpu) const
+std::string eTranNIC::queue_irq_name(unsigned int qid) const
 {
-    const auto &online = _cpu_topology.online;
-    if (qid >= _num_queues || !std::binary_search(online.begin(), online.end(), cpu))
-        return -EINVAL;
+    return "mlx5_comp" + std::to_string(qid + 1) + "@pci:" + pcie_name;
+}
 
-    const std::string vector = "mlx5_comp" + std::to_string(qid + 1) + "@pci:" + pcie_name;
+std::array<int, MAX_NIC_QUEUES> eTranNIC::read_queue_irqs() const
+{
+    std::array<int, MAX_NIC_QUEUES> irqs{};
+    std::array<std::string, MAX_NIC_QUEUES> names;
+    for (unsigned int qid = 0; qid < _num_queues; ++qid)
+        names[qid] = queue_irq_name(qid);
+
     std::ifstream interrupts("/proc/interrupts");
     std::string line;
     while (std::getline(interrupts, line)) {
-        if (line.find(vector) == std::string::npos)
+        const size_t name_end = line.find_last_not_of(" \t");
+        if (name_end == std::string::npos)
+            continue;
+        const size_t name_start = line.find_last_of(" \t", name_end);
+        if (name_start == std::string::npos)
+            continue;
+        const auto end = names.begin() + _num_queues;
+        const auto name = std::find(names.begin(), end,
+                                    line.substr(name_start + 1, name_end - name_start));
+        if (name == end)
             continue;
         std::istringstream fields(line);
         int irq;
-        if (!(fields >> irq))
-            return -EINVAL;
-        const std::string path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity_list";
-        FILE *file = fopen(path.c_str(), "w");
-        if (!file)
-            return -errno;
-        int written = fprintf(file, "%d\n", cpu);
-        int closed = fclose(file);
-        return written < 0 || closed != 0 ? -EIO : 0;
+        char colon;
+        if (fields >> irq >> colon && irq > 0 && colon == ':')
+            irqs[name - names.begin()] = irq;
     }
-    return -ENOENT;
+    return irqs;
+}
+
+int eTranNIC::get_queue_irq(unsigned int qid) const
+{
+    if (qid >= _num_queues)
+        return -EINVAL;
+
+    const int cached_irq = _queue_irqs[qid];
+    if (cached_irq > 0) {
+        std::ifstream actions("/sys/kernel/irq/" + std::to_string(cached_irq) + "/actions");
+        std::string name;
+        if (std::getline(actions, name) && name == queue_irq_name(qid))
+            return cached_irq;
+    }
+
+    const int irq = read_queue_irqs()[qid];
+    return irq > 0 ? irq : -ENOENT;
+}
+
+int eTranNIC::set_queue_cpu(unsigned int qid, int cpu) const
+{
+    const auto &online = _cpu_topology.online;
+    if (!std::binary_search(online.begin(), online.end(), cpu))
+        return -EINVAL;
+    const int irq = get_queue_irq(qid);
+    if (irq < 0)
+        return irq;
+
+    const std::string path = "/proc/irq/" + std::to_string(irq) + "/smp_affinity_list";
+    FILE *file = fopen(path.c_str(), "w");
+    if (!file)
+        return -errno;
+    int written = fprintf(file, "%d\n", cpu);
+    int closed = fclose(file);
+    return written < 0 || closed != 0 ? -EIO : 0;
 }
 
 static int check_nic(std::string if_name, unsigned int num_queues, std::string &pcie_name)
@@ -145,6 +188,8 @@ int eTranNIC::create_nic(void)
         fprintf(stderr, "Failed to configure NIC queues\n");
         return -1;
     }
+
+    _queue_irqs = read_queue_irqs();
 
     if (_intr_affinity)
     {

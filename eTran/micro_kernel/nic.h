@@ -2,6 +2,7 @@
 #define NIC_H
 
 #include "xskbp/xsk_buffer_pool.h"
+#include <array>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -104,10 +105,14 @@ public:
         destroy_nic();
     }
 
+    int get_queue_irq(unsigned int qid) const;
     int set_queue_cpu(unsigned int qid, int cpu) const;
 
 private:
     std::string pcie_name;
+    std::array<int, MAX_NIC_QUEUES> _queue_irqs{};
+    std::string queue_irq_name(unsigned int qid) const;
+    std::array<int, MAX_NIC_QUEUES> read_queue_irqs() const;
     int create_nic(void);
     void destroy_nic(void);
 };
