@@ -106,7 +106,8 @@
 | `6.6.0-eTran-compat3` | `etran-compat3-20` | `nosmt nr_cpus=20 panic=30` | 初版驱动解耦与生命周期补丁的 20 核对照 |
 | `6.6.0-eTran-compat3.1` | `etran-compat3-1-20` | `nosmt nr_cpus=20 panic=30` | 最终补丁（`553a8e9` 补齐清池后二次网络同步）的 20 核基线复验、跨核与重绑验收 |
 | `6.6.0-eTran-compat3.1` | `etran-compat3-1-24` | `nosmt panic=30`（解除 `nr_cpus=20`） | 24 核容量与高核号数据面验收，现为 24 核回退项 |
-| **`6.6.0-eTran-compat3.2`** | **`etran-compat3-2-24`** | **`nosmt panic=30`** | **BPF 整栈卸载的 TCP 回归通过后设为双端默认启动项** |
+| `6.6.0-eTran-compat3.2` | `etran-compat3-2-24` | `nosmt panic=30` | BPF 整栈卸载的 TCP 回归通过，保留为 24 核回退项 |
+| **`6.6.0-eTran-compat3.3`** | **`etran-compat3-3-24`** | **`nosmt panic=30`** | **通过活跃队列 NAPI 交接、双核时间轮及停流回收验收，现为双端默认启动项** |
 
 由于补丁同时涉及 `mlx5`、`AF_XDP`、`BPF_MAP_TYPE_PKT_QUEUE` 与新增 kfunc，部署与回退时必须将 **内核、模块、eTran 用户态二进制/库与 pacing eBPF 对象**按对应版本成套切换；若回退至 `compat2`，须配套切回阶段 A（`182dd51`）的构建产物。
 
