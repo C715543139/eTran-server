@@ -8,6 +8,7 @@
 #include "../ebpf_queue.h"
 #include "../ebpf_utils.h"
 #include "eTran_defs.h"
+#include "qid_stats.h"
 
 // send at most TW_BATCH_SIZE packets in one tw_cb
 #define TW_BATCH_SIZE 32
@@ -175,8 +176,17 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
             continue;
         }
 
+        struct bpf_qid_stats *stats = NULL;
+        __u32 frame_len = 0;
+        if (qid_stats_enabled) {
+            stats = qid_stats(xdpf->queue_index);
+            frame_len = xdpf->len;
+        }
+
         if (unlikely(bpf_dynptr_from_xdp_frame(xdpf, 0, &ptr))) {
             log_panic("bpf_dynptr_from_xdp_frame failed");
+            if (stats)
+                ++stats->tw_drop_pkts;
             bpf_packet_drop(xdpf);
             continue;
         }
@@ -185,6 +195,8 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
                             NULL, sizeof(*ts_opt));
         if (unlikely(!ts_opt)) {
             log_panic("bpf_dynptr_slice_rdwr failed");
+            if (stats)
+                ++stats->tw_drop_pkts;
             bpf_packet_drop(xdpf);
             continue;
         }
@@ -192,8 +204,14 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
         ts_opt->ts_val = bpf_htonl((__u32)now);
         
         if (unlikely(bpf_packet_send(xdpf, xdpf->tx_ifindex, 0))) {
+            if (stats)
+                ++stats->tw_drop_pkts;
             bpf_packet_drop(xdpf);
             continue;
+        }
+        if (stats) {
+            ++stats->tw_sent_pkts;
+            stats->tw_sent_bytes += frame_len;
         }
         submitted = true;
     }

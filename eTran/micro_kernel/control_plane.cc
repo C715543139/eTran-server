@@ -49,6 +49,7 @@
 #include "ebpf.h"
 #include "trans_ebpf.h"
 #include "nic.h"
+#include "scheduler.h"
 
 #define TICK_US 1000
 #include <regex>      // std::regex、std::smatch、std::regex_search
@@ -699,6 +700,10 @@ static void free_app_resources(struct app_ctx *actx)
 {
     if (actx->proto == IPPROTO_TCP)
     {
+        if (!actx->use_shared_queues) {
+            for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
+                scheduler_unregister_queue(actx->nic_qid[i]);
+        }
         free_tcp_resources(actx);
 #ifdef ALLOCATION
         release_app_cpus(actx);
@@ -1258,6 +1263,14 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         return error;
     }
 
+    #ifdef ALLOCATION
+    if (scheduler_collect_qid_stats() && actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
+        auto irq_cpu = actx->usedCores.begin();
+        const int app_cpu = req.nr_app_threads == 1 ? actx->usedCores.back() : -1;
+        for (unsigned int i = 0; i < req.nr_nic_queues; ++i, ++irq_cpu)
+            scheduler_register_queue(qids[i], actx->pid, actx->tcp_type, *irq_cpu, app_cpu);
+    }
+    #endif
     actx->done = true;
 
     return 0;

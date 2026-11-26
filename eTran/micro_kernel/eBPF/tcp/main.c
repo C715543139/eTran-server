@@ -234,6 +234,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
     __builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
 
     if (ret == XDP_REDIRECT) {
+        if (qid_stats_enabled) {
+            struct bpf_qid_stats *stats = qid_stats(ctx->rx_queue_index);
+            if (stats)
+                ++stats->tw_enq_attempts;
+        }
         kick_tw();
         return ret;
     } else if (ret == XDP_PASS) {
@@ -246,6 +251,13 @@ int xdp_egress_prog(struct xdp_md *ctx)
     xdp_egress_dump_ip(iph);
     xdp_egress_dump_tcp(tcph);
     #endif
+    if (qid_stats_enabled && ret == XDP_TX) {
+        struct bpf_qid_stats *stats = qid_stats(ctx->rx_queue_index);
+        if (stats) {
+            ++stats->tx_direct_pkts;
+            stats->tx_direct_bytes += ctx->data_end - ctx->data;
+        }
+    }
     return XDP_TX;
 
 redirect:
@@ -365,7 +377,15 @@ int xdp_sock_prog(struct xdp_md *ctx)
 
     barrier_var(qid);
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
-        return bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
+        ret = bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
+        if (qid_stats_enabled && ret == XDP_REDIRECT) {
+            struct bpf_qid_stats *stats = qid_stats(qid);
+            if (stats) {
+                ++stats->rx_xsk_pkts;
+                stats->rx_xsk_bytes += pkt_len;
+            }
+        }
+        return ret;
     }
 
     return XDP_DROP;

@@ -40,6 +40,10 @@
 #include <utils/utils.h>
 
 #include "nic.h"
+#include "scheduler.h"
+#include "trans_ebpf.h"
+
+extern eTranTCP *etran_tcp;
 
 bool force_quit = false;
 static int init_step = 0;
@@ -278,6 +282,9 @@ int main(int argc, char *argv[])
     }
     printf("[Step%d] eBPF init done.\n", ++init_step);
 
+    if (start_scheduler(topology, etran_nic->_num_queues, etran_tcp->qid_stats_fd))
+        goto err_2;
+
     /* launch threads */
     if (thread_init())
     {
@@ -298,6 +305,7 @@ int main(int argc, char *argv[])
     status = EXIT_SUCCESS;
 
 err_2:
+    stop_scheduler();
     ebpf_exit();
 err_1:
 

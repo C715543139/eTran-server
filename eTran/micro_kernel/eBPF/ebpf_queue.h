@@ -21,6 +21,7 @@ struct xdp_frame {
     __u32 frame_sz;
     __u32 flags;
     int tx_ifindex;
+    __u32 queue_index;
 } __attribute__((preserve_access_index));
 
 /* Operations on BPF_MAP_TYPE_PKT_QUEUE */

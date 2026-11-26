@@ -1,4 +1,4 @@
-protocols := entrance homa tcp
+protocols := entrance homa tcp sched
 
 all: $(protocols)
 

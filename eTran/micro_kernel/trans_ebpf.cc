@@ -1,4 +1,5 @@
 #include "trans_ebpf.h"
+#include "scheduler.h"
 
 #include <algorithm>
 
@@ -129,6 +130,14 @@ int eTranTCP::load_ebpf_programs(void)
         return err;
     }
 
+    const __u32 stats_enabled = scheduler_collect_qid_stats();
+    auto *settings = bpf_object__find_map_by_name(obj, ".rodata.qid_stats_enabled");
+    if (!settings || bpf_map__set_initial_value(settings, &stats_enabled, sizeof(stats_enabled))) {
+        fprintf(stderr, "ERROR: cannot configure TCP per-QID counters\n");
+        bpf_object__close(obj);
+        return -EINVAL;
+    }
+
     struct bpf_map *prev_conn = bpf_object__find_map_by_name(obj, ".data.prev_conn");
     size_t initial_size = 0;
     const auto *initial = prev_conn ?
@@ -224,6 +233,11 @@ static inline size_t roundup_page(size_t sz)
 
 int eTranTCP::init_ebpf_maps(void)
 {
+    auto *obj = xdp_program__bpf_obj(_ebpf.xdp_prog);
+    qid_stats_fd = bpf_object__find_map_fd_by_name(obj, "qid_stats_map");
+    if (qid_stats_fd < 0)
+        return qid_stats_fd;
+
     _tcp_connection_map_fd = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(_ebpf.xdp_prog), "bpf_tcp_conn_map"));
     if (_tcp_connection_map_fd < 0)
     {

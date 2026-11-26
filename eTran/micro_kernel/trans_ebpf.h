@@ -206,6 +206,7 @@ public:
 class eTranTCP : public eTranTransport
 {
 public:
+    int qid_stats_fd = -1;
     static constexpr unsigned int TCP_XDP_IDX = 0;
     static constexpr unsigned int TCP_XDP_CPUMAP_IDX = 1;
     static constexpr unsigned int TCP_XDP_EGRESS_IDX = 2;
