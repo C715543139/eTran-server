@@ -1802,7 +1802,7 @@ static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, st
     switch (hint) {
     case Q_EXCLUSIVE:
         if (free.size() < nr_queues)
-            return -E2BIG;
+            return -ENOSPC;
         qids.assign(free.rbegin(), free.rbegin() + nr_queues);
         break;
     case Q_SHARED:
@@ -1899,6 +1899,20 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     }
 
     if (int rc = try_allocate_queues(req.nr_nic_queues, req.queue_usage, qids)) {
+        if (rc == -ENOSPC && req.proto == IPPROTO_TCP && req.queue_usage == Q_EXCLUSIVE) {
+            size_t reclaiming = etran_nic->_free_exclusive_qids.size();
+            for (const auto *other : active_apps.apps) {
+                if (other->proto != IPPROTO_TCP || other->use_shared_queues ||
+                    (!other->resources_ready && !other->rss_ctx_id))
+                    continue;
+                pollfd socket{other->fd, POLLRDHUP, 0};
+                if (socket.fd < 0 || (poll(&socket, 1, 0) > 0 &&
+                                      (socket.revents & (POLLRDHUP | POLLHUP | POLLERR))))
+                    reclaiming += other->nr_nic_queues;
+            }
+            if (reclaiming >= req.nr_nic_queues)
+                return -EAGAIN;
+        }
         fprintf(stderr, "Cannot allocate NIC queues: %s\n", strerror(-rc));
         return rc;
     }
@@ -2203,12 +2217,28 @@ static int poll_uds_reply(app_ctx &app)
 static bool uds_wants_write(UdsState state)
 {
     return state != UdsState::RecvRequest && state != UdsState::RecvCpu &&
-           state != UdsState::Ready && state != UdsState::WaitMgmt;
+           state != UdsState::Ready && state != UdsState::WaitMgmt && state != UdsState::WaitQueue;
+}
+
+static void start_uds_registration(app_ctx &app)
+{
+    const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_requested_cpu);
+    if (error == -EINPROGRESS)
+        return;
+    if (error == -EAGAIN) {
+        if (app.uds_state != UdsState::WaitQueue)
+            app.uds_queue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        app.uds_state = UdsState::WaitQueue;
+    } else if (error) {
+        prepare_uds_response(app, UdsState::SendError, REG_FAIL, error);
+    } else {
+        prepare_uds_response(app, UdsState::SendXsk, REG_XSK_FD);
+    }
 }
 
 static int poll_uds_request(app_ctx &app)
 {
-    if (app.uds_state == UdsState::WaitMgmt)
+    if (app.uds_state == UdsState::WaitMgmt || app.uds_state == UdsState::WaitQueue)
         return -EPROTO;
     if (app.uds_state == UdsState::RecvCpu) {
         int rc = poll_uds_frame(app, &app.uds_requested_cpu, sizeof(app.uds_requested_cpu), false);
@@ -2229,13 +2259,7 @@ static int poll_uds_request(app_ctx &app)
         if (app.uds_req.type != REG_V2)
             return -EPROTO;
     }
-    const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_requested_cpu);
-    if (error == -EINPROGRESS)
-        return 1;
-    if (error)
-        prepare_uds_response(app, UdsState::SendError, REG_FAIL, error);
-    else
-        prepare_uds_response(app, UdsState::SendXsk, REG_XSK_FD);
+    start_uds_registration(app);
     return 1;
 }
 
@@ -2292,6 +2316,26 @@ static void poll_rss_results()
         }
         if (update_uds_interest(*app, false))
             destroy_app(app->fd);
+    }
+}
+
+static void poll_pending_queues()
+{
+    auto &apps = active_apps.apps;
+    for (size_t i = 0; i < apps.size();) {
+        auto &app = *apps[i];
+        if (app.uds_state != UdsState::WaitQueue) {
+            ++i;
+            continue;
+        }
+        if (std::chrono::steady_clock::now() >= app.uds_queue_deadline)
+            prepare_uds_response(app, UdsState::SendError, REG_FAIL, -ENOSPC);
+        else if (etran_nic->_free_exclusive_qids.size() >= app.uds_req.nr_nic_queues)
+            start_uds_registration(app);
+        if (update_uds_interest(app, false))
+            destroy_app(app.fd);
+        else
+            ++i;
     }
 }
 
@@ -2476,6 +2520,7 @@ static void *control_loop(void *arg)
         /* poll unix domain socket */
         poll_uds(enrollment_to_ms);
         poll_rss_results();
+        poll_pending_queues();
 
         /* poll lrpc channels */
         poll_lrpc();

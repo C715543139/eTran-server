@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 #include <list>
@@ -49,7 +50,7 @@ struct fd_rule_t {
 };
 
 enum class UdsState {
-    RecvRequest, SendCpuReady, RecvCpu, WaitMgmt, SendXsk, SendEvent, SendDone, SendError, Ready
+    RecvRequest, SendCpuReady, RecvCpu, WaitQueue, WaitMgmt, SendXsk, SendEvent, SendDone, SendError, Ready
 };
 
 // application context in kernel
@@ -67,6 +68,7 @@ struct app_ctx
     size_t uds_offset = 0;
     unsigned int uds_fd_batch = 0;
     int uds_requested_cpu = -1;
+    std::chrono::steady_clock::time_point uds_queue_deadline{};
 
     // transport protocol
     int proto;
