@@ -17,6 +17,7 @@
 #include <sstream>
 #include <string>
 #include <mutex>
+#include <optional>
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -98,6 +99,8 @@ static int cpuIrqRefs[MAX_CPU];
 static int cpuThroughputAppRefs[MAX_CPU];
 static bool scheduler_admission = false;
 static bool scheduler_degrade = false;
+static bool scheduler_manual = false;
+static unsigned int quarantine_refs[MAX_CPU];
 enum class CpuRole { Irq, App };
 static int cpuUsage[MAX_CPU]={0};//CPU利用率，80%在这里表示为80
 static std::array<std::atomic<int>, MAX_CPU> cpu_usage_sample{};
@@ -487,6 +490,8 @@ static int reserve_cpu(int type, CpuRole role, int cpu)
 {
     if (!valid_pool_cpu(cpu))
         return -EINVAL;
+    if (quarantine_refs[cpu])
+        return -EBUSY;
     availableCores.erase(cpu);
     if (type == LATENCY) {
         throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
@@ -504,36 +509,40 @@ static int reserve_cpu(int type, CpuRole role, int cpu)
     return cpu;
 }
 
+static void release_cpu(const app_ctx &app, CpuRole role, int cpu)
+{
+    if (role == CpuRole::Irq) {
+        assert(cpuIrqRefs[cpu] > 0);
+        --cpuIrqRefs[cpu];
+    } else if (app.tcp_type != LATENCY) {
+        assert(cpuThroughputAppRefs[cpu] > 0);
+        --cpuThroughputAppRefs[cpu];
+    }
+    assert(cpuUseRef[cpu] > 0);
+    --cpuUseRef[cpu];
+    if (app.tcp_type == LATENCY) {
+        assert(cpuLatUseRef[cpu] > 0);
+        --cpuLatUseRef[cpu];
+    }
+    if (cpuLatUseRef[cpu] == 0) {
+        latUsingCores.erase(std::remove(latUsingCores.begin(), latUsingCores.end(), cpu), latUsingCores.end());
+        if (cpuUseRef[cpu] == 0) {
+            throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
+            availableCores.insert(cpu);
+        } else if (std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
+            throughputUsingCores.push_back(cpu);
+        }
+    }
+    printf("CPU release pid=%d cpu=%d refs=%d latency_refs=%d available=%d\n",
+           app.pid, cpu, cpuUseRef[cpu], cpuLatUseRef[cpu], availableCores.count(cpu) != 0);
+}
+
 static void release_app_cpus(struct app_ctx *actx)
 {
     // usedCores contains the IRQ reservations first, including on partial failure.
     unsigned int slot = 0;
-    for (int cpu : actx->usedCores) {
-        if (slot++ < actx->nr_nic_queues) {
-            assert(cpuIrqRefs[cpu] > 0);
-            --cpuIrqRefs[cpu];
-        } else if (actx->tcp_type != LATENCY) {
-            assert(cpuThroughputAppRefs[cpu] > 0);
-            --cpuThroughputAppRefs[cpu];
-        }
-        assert(cpuUseRef[cpu] > 0);
-        cpuUseRef[cpu]--;
-        if (actx->tcp_type == LATENCY) {
-            assert(cpuLatUseRef[cpu] > 0);
-            cpuLatUseRef[cpu]--;
-        }
-        if (cpuLatUseRef[cpu] == 0) {
-            latUsingCores.erase(std::remove(latUsingCores.begin(), latUsingCores.end(), cpu), latUsingCores.end());
-            if (cpuUseRef[cpu] == 0) {
-                throughputUsingCores.erase(std::remove(throughputUsingCores.begin(), throughputUsingCores.end(), cpu), throughputUsingCores.end());
-                availableCores.insert(cpu);
-            } else if (std::find(throughputUsingCores.begin(), throughputUsingCores.end(), cpu) == throughputUsingCores.end()) {
-                throughputUsingCores.push_back(cpu);
-            }
-        }
-        printf("CPU release pid=%d cpu=%d refs=%d latency_refs=%d available=%d\n",
-               actx->pid, cpu, cpuUseRef[cpu], cpuLatUseRef[cpu], availableCores.count(cpu) != 0);
-    }
+    for (int cpu : actx->usedCores)
+        release_cpu(*actx, slot++ < actx->nr_nic_queues ? CpuRole::Irq : CpuRole::App, cpu);
     actx->usedCores.clear();
 }
 
@@ -542,6 +551,8 @@ static int select_cpu(int type, CpuRole role, int requested_app_cpu)
     // A throughput poller can become busy immediately after registration.
     // Account for its reserved role even when the load sample still shows idle.
     auto compatible = [&](int cpu) {
+        if (quarantine_refs[cpu])
+            return false;
         if (role == CpuRole::Irq)
             return cpuThroughputAppRefs[cpu] == 0 &&
                    (type == LATENCY || cpu != requested_app_cpu);
@@ -600,6 +611,9 @@ static int allocate_cpu(const app_ctx *actx, CpuRole role, int requested_cpu)
 
 static int place_new_tcp_app(app_ctx &app, int fixed_irq)
 {
+    if ((fixed_irq >= 0 && quarantine_refs[fixed_irq]) ||
+        (app.requested_app_cpu >= 0 && quarantine_refs[app.requested_app_cpu]))
+        return -EBUSY;
     auto free = availableCores;
     std::vector<int> irq_cpus, app_cpus;
     bool degraded = false;
@@ -633,11 +647,12 @@ static int place_new_tcp_app(app_ctx &app, int fixed_irq)
             if (app.tcp_type == THROUGHPUT) {
                 // The LAT-first three-core transient is limited to an unstacked IRQ-only LAT core.
                 for (const auto *other : active_apps.apps) {
-                    if (!other->done || other->proto != IPPROTO_TCP || other->use_shared_queues ||
+                    if (!other->resources_ready || other->proto != IPPROTO_TCP || other->use_shared_queues ||
                         other->tcp_type != LATENCY || other->nr_nic_queues != 1 || other->nr_app_threads != 1)
                         continue;
                     const int candidate = other->usedCores.front();
-                    if (candidate == app_cpu || cpuUseRef[candidate] != 1 || cpuIrqRefs[candidate] != 1)
+                    if (candidate == app_cpu || quarantine_refs[candidate] ||
+                        cpuUseRef[candidate] != 1 || cpuIrqRefs[candidate] != 1)
                         continue;
                     if (other->ports.empty() || scheduler_queue_is_light(other->nic_qid[0])) {
                         cpu = candidate;
@@ -713,7 +728,271 @@ static int bind_rss_core(struct app_ctx *actx, const std::vector<unsigned int> &
     }
     return 0;
 }
+
+struct WorkerMigrationRequest {
+    int pid;
+    unsigned int slot;
+    int cpu;
+    uint64_t start_time;
+};
+
+static std::mutex migration_request_mutex;
+static std::optional<WorkerMigrationRequest> migration_request;
+
+struct WorkerTaskState {
+    uint64_t start_time = 0;
+    int processor = -1;
+    char state = 0;
+};
+
+static std::string worker_task_path(const app_ctx &app, int tid)
+{
+    return "/proc/" + std::to_string(app.pid) + "/task/" + std::to_string(tid) + '/';
+}
+
+static WorkerTaskState read_worker_state(const std::string &path)
+{
+    std::ifstream stat(path + "stat");
+    std::string line, field;
+    WorkerTaskState result{};
+    if (!std::getline(stat, line))
+        return result;
+    const auto comm_end = line.rfind(')');
+    if (comm_end == std::string::npos)
+        return result;
+    std::istringstream fields(line.substr(comm_end + 1));
+    for (unsigned i = 3; i < 39; ++i) {
+        if (!(fields >> field))
+            return {};
+        if (i == 3)
+            result.state = field.front();
+        if (i == 22)
+            result.start_time = strtoull(field.c_str(), nullptr, 10);
+    }
+    if (!(fields >> result.processor) || result.state == 'Z' || result.state == 'X')
+        return {};
+    return result;
+}
+
+static bool worker_is_on(const app_ctx &app, const app_ctx_per_thread &worker, int cpu)
+{
+    const auto path = worker_task_path(app, worker.os_tid);
+    std::ifstream status(path + "status");
+    std::string line;
+    const std::string expected = std::to_string(cpu);
+    bool mask_matches = false;
+    while (std::getline(status, line)) {
+        if (line.compare(0, 18, "Cpus_allowed_list:") != 0)
+            continue;
+        const auto first = line.find_first_not_of(" \t", 18);
+        mask_matches = first != std::string::npos && line.substr(first) == expected;
+        break;
+    }
+    if (!mask_matches)
+        return false;
+    const auto task = read_worker_state(path);
+    return task.start_time == worker.os_start_time && (task.state != 'R' || task.processor == cpu);
+}
+
+class MigrationExecutor {
+    using Clock = std::chrono::steady_clock;
+    enum class State { Migrating, RollingBack };
+    struct Move {
+        app_ctx *app;
+        unsigned int slot;
+        int src, dst;
+        State state;
+        uint32_t seq;
+        Clock::time_point published;
+        bool wake_queued;
+    };
+    std::optional<Move> action;
+    std::vector<Move> quarantined;
+    Clock::time_point backoff_until{};
+    uint32_t next_seq = 0;
+
+    static int &worker_cpu(const Move &move)
+    {
+        auto it = move.app->usedCores.begin();
+        std::advance(it, move.app->nr_nic_queues + move.slot);
+        return *it;
+    }
+
+    void publish(Move &move, State state, int cpu)
+    {
+        auto *ctrl = move.app->tctx[move.slot].sched_ctrl;
+        if (++next_seq == 0)
+            ++next_seq;
+        move.seq = next_seq;
+        move.state = state;
+        move.published = Clock::now();
+        move.wake_queued = false;
+        const uint64_t command = (static_cast<uint64_t>(move.seq) << 32) | static_cast<uint32_t>(cpu);
+        __atomic_store_n(&ctrl->cmd_word, command, __ATOMIC_SEQ_CST);
+        fprintf(stderr, "sched_migration state=%s pid=%d slot=%u seq=%u from=%d to=%d\n",
+                state == State::Migrating ? "MIGRATING" : "ROLLING_BACK",
+                move.app->pid, move.slot, move.seq, state == State::Migrating ? move.src : move.dst, cpu);
+    }
+
+public:
+    int start(WorkerMigrationRequest request)
+    {
+        if (action || Clock::now() < backoff_until)
+            return -EBUSY;
+        const auto it = std::find_if(active_apps.apps.begin(), active_apps.apps.end(), [&](const auto *app) {
+            return app->done && app->fd >= 0 && app->pid == request.pid &&
+                   app->proto == IPPROTO_TCP && !app->use_shared_queues;
+        });
+        if (it == active_apps.apps.end())
+            return -ENOENT;
+        auto *app = *it;
+        if (read_worker_state(worker_task_path(*app, request.pid)).start_time != request.start_time)
+            return -ESTALE;
+        if (request.slot >= app->nr_app_threads || !valid_pool_cpu(request.cpu))
+            return -EINVAL;
+        auto &worker = app->tctx[request.slot];
+        if (!worker.os_tid || !worker.os_start_time)
+            return -EAGAIN;
+        Move move{app, request.slot, -1, request.cpu, State::Migrating, 0, {}, false};
+        move.src = worker_cpu(move);
+        if (move.src == move.dst)
+            return -EALREADY;
+        if (quarantine_refs[move.src] || quarantine_refs[move.dst])
+            return -EBUSY;
+        const bool own_light_irq = app->nr_nic_queues == 1 && app->nr_app_threads == 1 &&
+                                   app->tcp_type != THROUGHPUT && app->usedCores.front() == move.dst &&
+                                   cpuUseRef[move.dst] == 1 && scheduler_queue_is_light(app->nic_qid[0]);
+        if (cpuUseRef[move.dst] && !own_light_irq)
+            return -EBUSY;
+        if (!worker_is_on(*app, worker, move.src))
+            return -ESTALE;
+        if (int rc = reserve_cpu(app->tcp_type, CpuRole::App, move.dst); rc < 0)
+            return rc;
+        action = move;
+        publish(*action, State::Migrating, move.dst);
+        return 0;
+    }
+
+    void poll()
+    {
+        if (!action)
+            return;
+        auto &move = *action;
+        auto &worker = move.app->tctx[move.slot];
+        const auto elapsed = Clock::now() - move.published;
+        const bool rolling_back = move.state == State::RollingBack;
+        const int target = rolling_back ? move.src : move.dst;
+        const uint64_t reply = __atomic_load_n(&worker.sched_ctrl->ack_word, __ATOMIC_ACQUIRE);
+        const bool replied = (reply >> 32) == move.seq;
+        const uint32_t error = static_cast<uint32_t>(reply);
+
+        if (replied && !error && worker_is_on(*move.app, worker, target)) {
+            if (rolling_back) {
+                release_cpu(*move.app, CpuRole::App, move.dst);
+                backoff_until = Clock::now() + std::chrono::seconds(1);
+            } else {
+                worker_cpu(move) = move.dst;
+                if (move.app->nr_app_threads == 1)
+                    for (unsigned int i = 0; i < move.app->nr_nic_queues; ++i)
+                        scheduler_update_app_cpu(move.app->nic_qid[i], move.app->pid, move.dst);
+                release_cpu(*move.app, CpuRole::App, move.src);
+            }
+            fprintf(stderr, "sched_migration state=CONFIRM pid=%d slot=%u seq=%u cpu=%d rollback=%d elapsed_us=%lld\n",
+                    move.app->pid, move.slot, move.seq, target, rolling_back,
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+            action.reset();
+            return;
+        }
+        if (!rolling_back && ((replied && error) || elapsed >= std::chrono::milliseconds(50))) {
+            publish(move, State::RollingBack, move.src);
+            return;
+        }
+        if (rolling_back && elapsed >= std::chrono::milliseconds(150)) {
+            ++quarantine_refs[move.src];
+            ++quarantine_refs[move.dst];
+            quarantined.push_back(move);
+            fprintf(stderr, "sched_migration state=QUARANTINED pid=%d slot=%u seq=%u src=%d dst=%d\n",
+                    move.app->pid, move.slot, move.seq, move.src, move.dst);
+            action.reset();
+            return;
+        }
+        if (!move.wake_queued && !replied &&
+            ((__atomic_load_n(&worker.sched_ctrl->state_flags, __ATOMIC_SEQ_CST) & WORKER_FLAG_SLEEPING) ||
+             elapsed >= std::chrono::milliseconds(5))) {
+            lrpc_msg message{};
+            message.cmd = APPIN_TCP_SCHED_REBIND;
+            if (lrpc_send(&worker.kernel_out, &message) == 0) {
+                kick_evfd(worker.evfd);
+                move.wake_queued = true;
+            }
+        }
+    }
+
+    void cancel(const app_ctx &app)
+    {
+        if (!action || action->app != &app)
+            return;
+        fprintf(stderr, "sched_migration state=CANCELLED pid=%d slot=%u seq=%u\n",
+                app.pid, action->slot, action->seq);
+        // Keep the extra reservation until the resource owner finishes teardown.
+        ++quarantine_refs[action->src];
+        ++quarantine_refs[action->dst];
+        quarantined.push_back(*action);
+        action.reset();
+    }
+
+    void release(const app_ctx &app)
+    {
+        for (const auto &move : quarantined) {
+            if (move.app != &app)
+                continue;
+            --quarantine_refs[move.src];
+            --quarantine_refs[move.dst];
+            release_cpu(app, CpuRole::App, move.dst);
+        }
+        quarantined.erase(std::remove_if(quarantined.begin(), quarantined.end(), [&](const auto &move) {
+            return move.app == &app;
+        }), quarantined.end());
+    }
+};
+
+static MigrationExecutor migration_executor;
+
+static void poll_worker_migration()
+{
+    std::optional<WorkerMigrationRequest> request;
+    {
+        std::lock_guard<std::mutex> lock(migration_request_mutex);
+        request.swap(migration_request);
+    }
+    if (request) {
+        if (const int rc = migration_executor.start(*request))
+            fprintf(stderr, "sched_migration state=REJECTED pid=%d slot=%u to=%d error=%d\n",
+                    request->pid, request->slot, request->cpu, rc);
+    }
+    migration_executor.poll();
+}
 #endif
+
+int request_worker_migration(int pid, unsigned int slot, int cpu)
+{
+#ifdef ALLOCATION
+    if (!scheduler_manual)
+        return -EOPNOTSUPP;
+    if (pid <= 0 || cpu < 0)
+        return -EINVAL;
+    const auto start_time = read_worker_state("/proc/" + std::to_string(pid) + '/').start_time;
+    if (!start_time)
+        return -ENOENT;
+    std::lock_guard<std::mutex> lock(migration_request_mutex);
+    if (migration_request)
+        return -EBUSY;
+    migration_request = WorkerMigrationRequest{pid, slot, cpu, start_time};
+    return 0;
+#else
+    return -EOPNOTSUPP;
+#endif
+}
 
 static int create_tcp_rss_context(const std::vector<unsigned int> &qids)
 {
@@ -886,18 +1165,45 @@ static int register_xsk_map(int xsk_fd, int xsk_map_key, int proto)
 static void return_resources(app_ctx &app)
 {
 #ifdef ALLOCATION
-    if (app.proto == IPPROTO_TCP)
+    if (app.proto == IPPROTO_TCP) {
+        migration_executor.release(app);
         release_app_cpus(&app);
+    }
 #endif
     if (!app.use_shared_queues)
         for (unsigned int i = 0; i < app.nr_nic_queues; ++i)
             etran_nic->_free_exclusive_qids.push_back(app.nic_qid[i]);
 }
 
+static bool collect_cc_jitter()
+{
+    static const bool enabled = [] {
+        const char *flag = std::getenv("ETRAN_CC_JITTER");
+        return flag && strcmp(flag, "1") == 0;
+    }();
+    return enabled;
+}
+
+static uint64_t report_slow_control_step(const char *operation, const app_ctx &app, uint64_t start)
+{
+    if (!start)
+        return 0;
+    const auto end = get_cycles();
+    const auto us = static_cast<unsigned long long>(cycles_to_us(end - start));
+    if (us > 500)
+        fprintf(stderr, "cc_jitter_source operation=%s pid=%d app_gen=%llu elapsed_us=%llu\n",
+                operation, app.pid, static_cast<unsigned long long>(app.generation), us);
+    return end;
+}
+
 static void free_app_resources(struct app_ctx *actx, bool return_queues)
 {
+    auto stage = collect_cc_jitter() ? get_cycles() : 0;
     if (actx->proto == IPPROTO_TCP)
     {
+#ifdef ALLOCATION
+        migration_executor.cancel(*actx);
+#endif
         scheduler_unregister_workers(actx->generation);
         if (actx->done && !actx->use_shared_queues) {
             for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
@@ -913,6 +1219,7 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
 
     if (return_queues)
         destroy_rss_context(actx);
+    stage = report_slow_control_step("flow_cleanup", *actx, stage);
 
     for (unsigned int i = 0; i < actx->nr_nic_queues; i++)
     {
@@ -965,6 +1272,7 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
         return_resources(*actx);
     actx->done = false;
     actx->resources_ready = false;
+    report_slow_control_step("socket_cleanup", *actx, stage);
 }
 
 static void destroy_all_apps(void)
@@ -1072,6 +1380,7 @@ static void prepare_uds_response(app_ctx &app, UdsState state, resp_type type, i
         for (unsigned int i = 0; i < actx->nr_nic_queues; i++)
             resp.nic_qid[i] = actx->nic_qid[i];
         #ifdef ALLOCATION
+        resp.sched_cooperative = scheduler_manual && actx->proto == IPPROTO_TCP && !actx->use_shared_queues;
         resp.cpuLen=actx->usedCores.size();
         int idx=0;
         for (auto core : actx->usedCores) {
@@ -1258,6 +1567,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     std::array<bool, MAX_NIC_QUEUES> ctrl_registered{};
     std::array<unsigned int, MAX_APP_THREADS> registered_data{};
     int error = -ENOMEM;
+    auto stage = collect_cc_jitter() ? get_cycles() : 0;
 
     if (req.nr_app_threads == 0 || req.nr_app_threads > MAX_APP_THREADS ||
         req.nr_nic_queues == 0 || req.nr_nic_queues > etran_nic->_num_queues)
@@ -1350,6 +1660,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         goto err;
     }
     printf("init_lrpc_channels success\n");
+    stage = report_slow_control_step("reserve_and_lrpc", *actx, stage);
 
     if (actx->use_shared_queues && etran_nic->_shared_queues_ready) {
         // Use shared BP
@@ -1371,6 +1682,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         }
         printf("Created new BP.\n");
     }
+    stage = report_slow_control_step("buffer_pool", *actx, stage);
 
     for (unsigned int i = 0; i < req.nr_nic_queues; i++)
     {
@@ -1412,6 +1724,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         actx->umem_id = xdp_opts.umem_id;
     }
     printf("init etran_nic->_nic_queues success\n");
+    stage = report_slow_control_step("control_xsk", *actx, stage);
 
     // TX/RX XSKs
     for (unsigned int i = 0; i < req.nr_app_threads; i++)
@@ -1479,6 +1792,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     printf("req.nr_app_threads(%u), req.nr_nic_queues(%u)\n", req.nr_app_threads, req.nr_nic_queues);
     if (thread_bcache_create(&actx->bpw, &actx->iobuffer))
         goto err;
+    report_slow_control_step("data_xsk_and_maps", *actx, stage);
 
     actx->resources_ready = true;
     if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
@@ -1861,8 +2175,7 @@ static void *control_loop(void *arg)
 {
     struct epoll_event ev;
     uint64_t tcp_s, tcp_e, homa_next_tsc = 0;
-    const char *cc_jitter_flag = std::getenv("ETRAN_CC_JITTER");
-    const bool track_cc_jitter = cc_jitter_flag && strcmp(cc_jitter_flag, "1") == 0;
+    const bool track_cc_jitter = collect_cc_jitter();
     CcJitter cc_jitter;
 
     epfd = epoll_create1(0);
@@ -1889,6 +2202,10 @@ static void *control_loop(void *arg)
 
         /* poll lrpc channels */
         poll_lrpc();
+#ifdef ALLOCATION
+        if (scheduler_manual)
+            poll_worker_migration();
+#endif
 
         /* poll network packets */
         poll_network(network_to_ms);
@@ -1943,6 +2260,7 @@ int thread_init(void)
         return -EINVAL;
     }
     scheduler_admission = (mode && strcmp(mode, "admit_only") == 0) || (enable && strcmp(enable, "1") == 0);
+    scheduler_manual = mode && strcmp(mode, "manual_actuate") == 0;
     scheduler_degrade = policy && strcmp(policy, "degrade") == 0;
     latUsingCores.clear();
     throughputUsingCores.clear();
@@ -2233,6 +2551,8 @@ static void process_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
             if (access(task.c_str(), F_OK) == 0) {
                 tctx->os_tid = identity.os_tid;
 #ifdef ALLOCATION
+                if (scheduler_manual)
+                    tctx->os_start_time = read_worker_state(worker_task_path(*app, identity.os_tid)).start_time;
                 auto cpu = app->usedCores.begin();
                 std::advance(cpu, app->nr_nic_queues + identity.worker_idx);
                 scheduler_register_worker_slot(app->generation, identity.worker_idx, *cpu, app->tcp_type);

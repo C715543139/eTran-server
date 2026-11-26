@@ -15,5 +15,6 @@ void scheduler_unregister_queue(unsigned int qid);
 void scheduler_register_flow(unsigned int cc_idx, unsigned int qid);
 void scheduler_unregister_flow(unsigned int cc_idx);
 void scheduler_register_worker(unsigned int qid, int pid, int tid);
+void scheduler_update_app_cpu(unsigned int qid, int pid, int cpu);
 void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo);
 void scheduler_unregister_workers(uint64_t generation);

@@ -39,9 +39,10 @@ struct Settings {
     const char *sample_flag = std::getenv("ETRAN_QID_STATS_SAMPLE");
     bool shadow = mode && strcmp(mode, "shadow") == 0;
     bool admit_only = mode && strcmp(mode, "admit_only") == 0;
+    bool manual = mode && strcmp(mode, "manual_actuate") == 0;
     bool sample = !sample_flag || strcmp(sample_flag, "0") != 0;
     bool probe_enabled = probe && strcmp(probe, "1") == 0;
-    bool qid_enabled = shadow || admit_only || (qid && strcmp(qid, "1") == 0);
+    bool qid_enabled = shadow || admit_only || manual || (qid && strcmp(qid, "1") == 0);
     bool verbose = shadow || (verbose_flag && strcmp(verbose_flag, "1") == 0);
 };
 
@@ -575,6 +576,14 @@ void scheduler_register_worker(unsigned int qid, int pid, int tid)
         entry.tid = tid;
 }
 
+void scheduler_update_app_cpu(unsigned int qid, int pid, int cpu)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    auto &entry = registrations[qid];
+    if (entry.pid == pid)
+        entry.app_cpu = cpu;
+}
+
 void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo)
 {
     if (!settings().shadow || cpu < 0 || cpu >= MAX_CPU)
@@ -603,8 +612,8 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
                     int tw_pending_fd, const bpf_cc_map_user *cc)
 {
     const auto &config = settings();
-    if (config.mode && strcmp(config.mode, "off") && !config.shadow && !config.admit_only) {
-        fprintf(stderr, "ETRAN_SCHED_MODE must be off, shadow, or admit_only\n");
+    if (config.mode && strcmp(config.mode, "off") && !config.shadow && !config.admit_only && !config.manual) {
+        fprintf(stderr, "ETRAN_SCHED_MODE must be off, shadow, admit_only, or manual_actuate\n");
         return -EINVAL;
     }
     if (config.probe_enabled && !config.qid_enabled) {
@@ -614,7 +623,7 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
     if (!config.qid_enabled && !config.probe_enabled)
         return 0;
     if (!config.sample) {
-        if (config.shadow || config.admit_only || config.probe_enabled) {
+        if (config.shadow || config.admit_only || config.manual || config.probe_enabled) {
             fprintf(stderr, "ETRAN_QID_STATS_SAMPLE=0 is only for counters-only off-mode comparisons\n");
             return -EINVAL;
         }

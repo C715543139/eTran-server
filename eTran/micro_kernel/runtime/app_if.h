@@ -34,6 +34,7 @@ struct app_ctx_per_thread
     struct lrpc_chan_out kernel_out;
     worker_sched_ctrl *sched_ctrl = nullptr;
     int os_tid = 0;
+    uint64_t os_start_time = 0;
 
     int evfd;
 

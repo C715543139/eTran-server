@@ -213,6 +213,17 @@ static void run_monitor(void)
         {
             kick_napi();
         }
+        else if (command.compare(0, 8, "migrate ") == 0)
+        {
+            std::istringstream input(command);
+            std::string action, entity, extra;
+            int pid, cpu;
+            unsigned int slot;
+            if (!(input >> action >> entity >> pid >> slot >> cpu) || entity != "worker" || (input >> extra))
+                fprintf(stderr, "Usage: migrate worker PID SLOT CPU\n");
+            else if (int rc = request_worker_migration(pid, slot, cpu))
+                fprintf(stderr, "Migration request failed: %s\n", strerror(-rc));
+        }
         else
         {
             printf("Unknown command: %s\n", command.c_str());
