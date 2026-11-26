@@ -32,6 +32,8 @@ struct app_ctx_per_thread
 
     struct lrpc_chan_in kernel_in;
     struct lrpc_chan_out kernel_out;
+    worker_sched_ctrl *sched_ctrl = nullptr;
+    int os_tid = 0;
 
     int evfd;
 
@@ -45,6 +47,10 @@ struct fd_rule_t {
     bool source;
 };
 
+enum class UdsState {
+    RecvRequest, SendCpuReady, RecvCpu, SendXsk, SendEvent, SendDone, SendError, Ready
+};
+
 // application context in kernel
 struct app_ctx
 {
@@ -53,12 +59,19 @@ struct app_ctx
 
     // use it to kill the application
     int pid;
+    uint64_t generation;
+    UdsState uds_state = UdsState::RecvRequest;
+    register_request uds_req{};
+    register_response uds_resp{};
+    size_t uds_offset = 0;
+    unsigned int uds_fd_batch = 0;
+    int uds_requested_cpu = -1;
 
     // transport protocol
     int proto;
 
     // RSS context id
-    int rss_ctx_id;
+    int rss_ctx_id = 0;
 
     // if we have allocated resources for this application
     bool done;
@@ -105,7 +118,7 @@ struct app_ctx
     int requested_app_cpu = -1;
     #endif
 
-    app_ctx() : rss_ctx_id(0) {}
+    app_ctx() = default;
 };
 
 struct apps_info

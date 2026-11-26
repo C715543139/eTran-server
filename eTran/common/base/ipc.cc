@@ -64,154 +64,66 @@ ssize_t read_all(int fd, void *buffer, size_t count)
  */
 int transfer_fd(int sockfd, int fd)
 {
-    assert(sockfd >= 0);
-    assert(fd >= 0);
-    struct msghdr msg;
-    struct cmsghdr *cmsg;
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(fd))];
-    memset(&msg, 0, sizeof(msg));
-    memset(buf, 0, sizeof(buf));
-    const char *name = "fd";
-    iov.iov_base = (void *)name;
-    iov.iov_len = 4;
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(fd));
-
-    *((int *)CMSG_DATA(cmsg)) = fd;
-
-    msg.msg_controllen = CMSG_SPACE(sizeof(fd));
-
-    if (sendmsg(sockfd, &msg, 0) < 0)
-    {
-        fprintf(stderr, "sendmsg failed\n");
-        return -1;
-    }
-    return 0;
+    return transfer_fds(sockfd, &fd, 1);
 }
 
-// multiple fds version
-int transfer_fds(int sockfd, int* fds, int fd_count) {
-    assert(sockfd >= 0);
-    assert(fds != NULL);
-    assert(fd_count > 0);
-
-    struct msghdr msg;
-    struct cmsghdr *cmsg;
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int) * fd_count)];
-    memset(&msg, 0, sizeof(msg));
-    memset(buf, 0, sizeof(buf));
-    const char *name = "fds";
-    iov.iov_base = (void *)name;
-    iov.iov_len = 4;
+int transfer_fds(int sockfd, const int *fds, int fd_count)
+{
+    char payload = 0;
+    iovec iov{&payload, sizeof(payload)};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * fd_count)]{};
+    msghdr msg{};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
 
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
+    auto *header = CMSG_FIRSTHDR(&msg);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int) * fd_count);
+    memcpy(CMSG_DATA(header), fds, sizeof(int) * fd_count);
 
-    cmsg = CMSG_FIRSTHDR(&msg);
-    cmsg->cmsg_level = SOL_SOCKET;
-    cmsg->cmsg_type = SCM_RIGHTS;
-    cmsg->cmsg_len = CMSG_LEN(sizeof(int) * fd_count);
-
-    memcpy((int *)CMSG_DATA(cmsg), fds, sizeof(int) * fd_count);
-
-    msg.msg_controllen = cmsg->cmsg_len;
-
-    if (sendmsg(sockfd, &msg, 0) < 0) {
-        fprintf(stderr, "sendmsg failed\n");
-        return -1;
-    }
-
-    return 0;
+    // SCM_RIGHTS is attached to one byte, so a successful write commits the whole batch.
+    const ssize_t size = sendmsg(sockfd, &msg, MSG_NOSIGNAL);
+    return size < 0 ? -errno : size == 1 ? 0 : -EIO;
 }
 
-/**
- * @brief receive fd from another process through sockfd
- *
- * @param sockfd
- * @param fd
- * @return int
- */
 int receive_fd(int sockfd, int *fd)
 {
-    assert(sockfd >= 0);
-    struct msghdr msg;
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int))];
-    struct cmsghdr *cmsg;
-
-    iov.iov_base = buf;
-    iov.iov_len = sizeof(buf);
-
-    msg.msg_name = 0;
-    msg.msg_namelen = 0;
-
-    msg.msg_iov = &iov;
-    msg.msg_iovlen = 1;
-
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-    if (recvmsg(sockfd, &msg, 0) < 0)
-    {
-        perror("recvmsg failed\n");
-        return -1;
-    }
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == NULL || cmsg->cmsg_type != SCM_RIGHTS)
-    {
-        perror("recvmsg failed\n");
-        return -1;
-    }
-    *fd = *((int *)CMSG_DATA(cmsg));
-    return 0;
+    return receive_fds(sockfd, fd, 1);
 }
 
-// multiple fds version
-int receive_fds(int sockfd, int* fds, int fd_count) {
-    assert(sockfd >= 0);
-    assert(fds != NULL);
-    assert(fd_count > 0);
-
-    struct msghdr msg;
-    struct iovec iov;
-    char buf[CMSG_SPACE(sizeof(int) * fd_count)];
-    struct cmsghdr *cmsg;
-
-    iov.iov_base = buf;
-    iov.iov_len = sizeof(buf);
-
-    msg.msg_name = 0;
-    msg.msg_namelen = 0;
-
+int receive_fds(int sockfd, int *fds, int fd_count)
+{
+    char payload;
+    iovec iov{&payload, sizeof(payload)};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int) * fd_count)]{};
+    msghdr msg{};
     msg.msg_iov = &iov;
     msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = sizeof(control);
+    ssize_t size;
+    do {
+        size = recvmsg(sockfd, &msg, MSG_CMSG_CLOEXEC);
+    } while (size < 0 && errno == EINTR);
+    if (size < 0)
+        return -errno;
 
-    msg.msg_control = buf;
-    msg.msg_controllen = sizeof(buf);
-    if (recvmsg(sockfd, &msg, 0) < 0) {
-        perror("recvmsg failed\n");
-        return -1;
+    auto *header = CMSG_FIRSTHDR(&msg);
+    if (size != 1 || !header || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+        return -EPROTO;
+
+    const size_t bytes = header->cmsg_len - CMSG_LEN(0);
+    if ((msg.msg_flags & MSG_CTRUNC) || bytes != sizeof(int) * fd_count) {
+        for (size_t i = 0; i < bytes / sizeof(int); ++i) {
+            int fd;
+            memcpy(&fd, CMSG_DATA(header) + i * sizeof(int), sizeof(fd));
+            close(fd);
+        }
+        return -EPROTO;
     }
-
-    cmsg = CMSG_FIRSTHDR(&msg);
-    if (cmsg == NULL || cmsg->cmsg_type != SCM_RIGHTS) {
-        perror("recvmsg failed\n");
-        return -1;
-    }
-
-    memcpy(fds, (int *)CMSG_DATA(cmsg), sizeof(int) * fd_count);
-
+    memcpy(fds, CMSG_DATA(header), bytes);
     return 0;
 }

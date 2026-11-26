@@ -16,6 +16,7 @@
 #define ETRAN_TCP_LATENCY 0
 #define ETRAN_TCP_THROUGHPUT 1
 #define ETRAN_HOMA 2
+#define ETRAN_TCP_AUTO 3
 
 
 // size must be power of 2
@@ -165,6 +166,8 @@ struct app_ctx_per_thread {
 
     struct lrpc_chan_in app_in;
     struct lrpc_chan_out app_out;
+    worker_sched_ctrl *sched_ctrl = nullptr;
+    uint32_t last_applied_seq = 0;
 
     int evfd;
 

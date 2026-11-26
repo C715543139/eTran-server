@@ -443,6 +443,29 @@ static inline int connection_prepare_buffer(struct app_ctx_per_thread *tctx, str
     return 0;
 }
 
+static bool apply_worker_sched_command(struct app_ctx_per_thread *tctx)
+{
+    auto *ctrl = tctx->sched_ctrl;
+    const uint64_t command = __atomic_load_n(&ctrl->cmd_word, __ATOMIC_SEQ_CST);
+    const uint32_t seq = command >> 32;
+    if (seq == 0 || seq == tctx->last_applied_seq)
+        return false;
+
+    const int32_t cpu = static_cast<int32_t>(command);
+    uint32_t err = EINVAL;
+    if (cpu >= 0 && cpu < CPU_SETSIZE) {
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        CPU_SET(cpu, &cpus);
+        err = sched_setaffinity(0, sizeof(cpus), &cpus) == 0 ? 0 : errno;
+        if (!err)
+            __atomic_store_n(&ctrl->applied_cpu, cpu, __ATOMIC_RELAXED);
+    }
+    tctx->last_applied_seq = seq;
+    __atomic_store_n(&ctrl->ack_word, (static_cast<uint64_t>(seq) << 32) | err, __ATOMIC_RELEASE);
+    return true;
+}
+
 static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event *ret_events, int max_events)
 {
     int nr_eventfd_work = 0;
@@ -464,6 +487,10 @@ static inline int process_tcp_kernel_events(struct app_ctx_per_thread *tctx, str
 
         switch (msg.cmd)
         {
+        case APPIN_TCP_SCHED_REBIND:
+            if (tctx->sched_ctrl)
+                apply_worker_sched_command(tctx);
+            break;
         case APPIN_TCP_EVENT_NEWCONN:
             newconn_msg = (struct appin_tcp_event_newconn_t *)msg.data;
             ret_events[nr_event].type = ETRANTCP_EV_LISTEN_NEWCONN;
@@ -630,10 +657,21 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
     }
 
     nr_event += process_tcp_kernel_events(tctx, ret_events + nr_event, budget - nr_event);
-    timeout = 0;
+    auto *ctrl = tctx->sched_ctrl;
+    if (ctrl && !nr_event && timeout != 0) {
+        __atomic_store_n(&ctrl->state_flags, WORKER_FLAG_SLEEPING, __ATOMIC_SEQ_CST);
+        if (apply_worker_sched_command(tctx))
+            timeout = 0;
+    } else {
+        timeout = 0;
+    }
 
     // step2: receive packets (<= budget) from **all** NIC queues in a deficit round-robin manner
     nfds = libc_epoll_wait(tctx->epfd, events, nr_nic_queues + 1, timeout);
+    if (ctrl) {
+        __atomic_store_n(&ctrl->state_flags, 0, __ATOMIC_SEQ_CST);
+        apply_worker_sched_command(tctx);
+    }
     if (unlikely(nfds < 0))
     {
         perror("epoll_wait");
@@ -1049,6 +1087,8 @@ int eTran_tcp_poll_events(struct app_ctx_per_thread *tctx, struct eTrantcp_event
     int nr_event = 0;
     int ret = 0;
 
+    if (unlikely(tctx->sched_ctrl != nullptr))
+        apply_worker_sched_command(tctx);
     tcp_ebpf_sync(tctx);
 
     if (timeout == 0)

@@ -13,7 +13,7 @@
 int transfer_fd(int sockfd, int fd);
 int receive_fd(int sockfd, int *fd);
 
-int transfer_fds(int sockfd, int* fds, int fd_count);
+int transfer_fds(int sockfd, const int* fds, int fd_count);
 int receive_fds(int sockfd, int* fds, int fd_count);
 
 ssize_t write_all(int fd, const void *buffer, size_t count);

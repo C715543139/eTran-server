@@ -25,6 +25,7 @@
 
 #include <runtime/cpu_topology.h>
 #include <intf/intf_ebpf.h>
+#include <intf/intf.h>
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -37,7 +38,7 @@ struct Settings {
     const char *verbose_flag = std::getenv("ETRAN_SCHED_VERBOSE");
     bool shadow = mode && strcmp(mode, "shadow") == 0;
     bool probe_enabled = probe && strcmp(probe, "1") == 0;
-    bool qid_enabled = shadow || probe_enabled || (qid && strcmp(qid, "1") == 0);
+    bool qid_enabled = shadow || (qid && strcmp(qid, "1") == 0);
     bool verbose = shadow || (verbose_flag && strcmp(verbose_flag, "1") == 0);
 };
 
@@ -149,6 +150,7 @@ struct QueueSample {
     unsigned int high = 0, low = 0, idle = 0;
     double bps = 0, pps = 0;
     bool sampled = false, paced = false, drops = false;
+    bool noisy = false;
     int tid = 0;
     uint64_t last_wait = 0;
     bool have_wait = false;
@@ -156,6 +158,12 @@ struct QueueSample {
 };
 
 std::array<Registration, MAX_NIC_QUEUES> registrations;
+struct WorkerSlot {
+    uint64_t generation;
+    unsigned int slot;
+    int cpu, slo;
+};
+std::vector<WorkerSlot> workers;
 std::mutex registration_mutex;
 std::thread sampler;
 std::condition_variable sampler_wake;
@@ -261,6 +269,64 @@ double load_weight(const QueueSample &sample)
     return sample.pps + sample.bps / (1500 * 8);
 }
 
+enum Redline : unsigned int { R1 = 1, R2 = 2, R3 = 4, R4 = 8 };
+
+void report_shadow(const std::array<Registration, MAX_NIC_QUEUES> &snapshot,
+                   const std::array<QueueSample, MAX_NIC_QUEUES> &samples,
+                   const std::vector<WorkerSlot> &slots, const std::vector<int> &pool)
+{
+    static std::array<unsigned, MAX_CPU> last{};
+    static std::array<unsigned, MAX_CPU> reported{};
+    std::array<unsigned, MAX_CPU> worker_counts{};
+    for (const auto &worker : slots)
+        ++worker_counts[worker.cpu];
+
+    int spare = -1;
+    for (int cpu : pool) {
+        if (!worker_counts[cpu] &&
+            std::none_of(snapshot.begin(), snapshot.end(), [cpu](const auto &queue) {
+                return queue.pid && queue.irq_cpu == cpu;
+            })) {
+            spare = cpu;
+            break;
+        }
+    }
+
+    constexpr unsigned rules[] = {R1, R2, R3, R4};
+    for (int cpu : pool) {
+        unsigned flags = worker_counts[cpu] > 1 ? R3 : 0U;
+        for (size_t qid = 0; qid < snapshot.size(); ++qid) {
+            const auto &queue = snapshot[qid];
+            const auto &sample = samples[qid];
+            if (!queue.pid || queue.irq_cpu != cpu || !sample.sampled)
+                continue;
+            if (worker_counts[cpu] &&
+                (sample.profile == Profile::Heavy ||
+                 (sample.profile == Profile::Unknown && sample.noisy)))
+                flags |= R1;
+            if (sample.profile == Profile::Light &&
+                std::any_of(slots.begin(), slots.end(), [cpu](const auto &worker) {
+                    return worker.cpu == cpu && worker.slo == THROUGHPUT;
+                }))
+                flags |= R2;
+            if (sample.profile == Profile::Heavy &&
+                std::any_of(snapshot.begin(), snapshot.end(), [&](const auto &other) {
+                    return &other != &queue && other.pid && other.irq_cpu == cpu && other.slo == LATENCY;
+                }))
+                flags |= R4;
+        }
+        const unsigned confirmed = flags & last[cpu];
+        const unsigned added = confirmed & ~reported[cpu];
+        for (size_t i = 0; i < std::size(rules); ++i) {
+            if (added & rules[i])
+                fprintf(stderr, "sched_decision mode=shadow rule=R%zu cpu=%d free_cpu=%d\n",
+                        i + 1, cpu, spare);
+        }
+        last[cpu] = flags;
+        reported[cpu] = (reported[cpu] & flags) | confirmed;
+    }
+}
+
 void update_wait(const Registration &app, QueueSample &state, double hz)
 {
     if (app.tid != state.tid) {
@@ -285,7 +351,8 @@ void update_wait(const Registration &app, QueueSample &state, double hz)
 }
 
 void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
-                   int cpus, int softirq_fd, const bpf_cc_map_user &cc, Thresholds limits)
+                   int cpus, int softirq_fd, const bpf_cc_map_user &cc, Thresholds limits,
+                   const std::vector<int> &pool)
 {
     std::array<QueueSample, MAX_NIC_QUEUES> queue_state{};
     std::array<bpf_qid_napi_stats, MAX_NIC_QUEUES> napi{};
@@ -297,6 +364,7 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
     std::vector<uint64_t> counts(cpus), last_counts(cpus);
     auto now = Clock::now();
     bool probe_baseline = false, counts_baseline = false;
+    std::vector<WorkerSlot> worker_snapshot;
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(sampler_mutex);
@@ -331,6 +399,8 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
         {
             std::lock_guard<std::mutex> lock(registration_mutex);
             snapshot = registrations;
+            if (settings().shadow)
+                worker_snapshot = workers;
         }
         std::array<QueueProgress, MAX_NIC_QUEUES> progress{};
         sample_progress(cc, flows, progress);
@@ -395,6 +465,7 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             const bool valid_counts = have_counts && counts_baseline;
             const bool noisy = (valid_probe && core.irq() > 0.20) ||
                                (valid_counts && (counts[app.irq_cpu] - last_counts[app.irq_cpu]) * 1e9 / tick_ns > 5000);
+            state.noisy = noisy;
             const bool blocked = state.drops || progress[qid].stalled ||
                                  (idle && (!have_pending || pending[app.irq_cpu] || noisy ||
                                            (!valid_probe && !valid_counts)));
@@ -426,6 +497,8 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                 state.last_log = now;
             }
         }
+        if (settings().shadow)
+            report_shadow(snapshot, queue_state, worker_snapshot, pool);
         if (have_probe)
             last_probe.swap(softirq);
         if (have_counts)
@@ -483,12 +556,40 @@ void scheduler_register_worker(unsigned int qid, int pid, int tid)
         entry.tid = tid;
 }
 
+void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo)
+{
+    if (!settings().shadow || cpu < 0 || cpu >= MAX_CPU)
+        return;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    auto existing = std::find_if(workers.begin(), workers.end(), [=](const auto &worker) {
+        return worker.generation == generation && worker.slot == slot;
+    });
+    if (existing == workers.end())
+        workers.push_back({generation, slot, cpu, slo});
+    else
+        *existing = {generation, slot, cpu, slo};
+}
+
+void scheduler_unregister_workers(uint64_t generation)
+{
+    if (!settings().shadow)
+        return;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    workers.erase(std::remove_if(workers.begin(), workers.end(), [generation](const auto &worker) {
+        return worker.generation == generation;
+    }), workers.end());
+}
+
 int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_fd, int tw_fd,
                     int tw_pending_fd, const bpf_cc_map_user *cc)
 {
     const auto &config = settings();
     if (config.mode && strcmp(config.mode, "off") && !config.shadow) {
         fprintf(stderr, "ETRAN_SCHED_MODE must be off or shadow during telemetry validation\n");
+        return -EINVAL;
+    }
+    if (config.probe_enabled && !config.qid_enabled) {
+        fprintf(stderr, "ETRAN_SOFTIRQ_PROBE=1 requires ETRAN_QID_STATS=1 in off mode\n");
         return -EINVAL;
     }
     if (!config.qid_enabled && !config.probe_enabled)
@@ -534,7 +635,7 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
     try {
         sampler = std::thread([=] {
             sample_queues(queues, napi_fd, tw_fd, tw_pending_fd, possible,
-                          probe ? probe->map_fd : -1, *cc, limits);
+                          probe ? probe->map_fd : -1, *cc, limits, topology.pool);
         });
     } catch (const std::system_error &err) {
         probe.reset();

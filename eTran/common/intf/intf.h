@@ -38,12 +38,15 @@ enum req_type {
     REG,
     UNREG,
     REG_CPU,
+    REG_V2,
+    REG_CPU_V2,
 };
 
 enum tcp_type {
     LATENCY,
     THROUGHPUT,
     HOMA,
+    AUTO,
 };
 
 enum queue_usage_hint : uint32_t {
@@ -67,7 +70,7 @@ struct register_request {
     /* networ address consists of IPv4 address and port number */
     struct eTran_netaddr addr;
 
-    enum tcp_type tcp_type; // TCP type 0 for Latency, 1 for Throughput, 2 for Homa(useless)
+    enum tcp_type tcp_type;
 } __attribute__((packed));
 
 enum resp_type {
@@ -82,6 +85,8 @@ enum resp_type {
 /* response format used for control path response */
 struct register_response {
     enum resp_type type;
+    int32_t err_code;
+    uint32_t sched_cooperative;
 
     size_t shm_bp_size;
 
@@ -106,6 +111,20 @@ struct register_response {
 } __attribute__((packed));
 
 #define MAX_MSG_SIZE 56
+
+constexpr uint32_t WORKER_FLAG_SLEEPING = 1u;
+
+struct alignas(64) worker_sched_ctrl {
+    uint64_t cmd_word;
+    uint8_t pad0[56];
+    uint64_t ack_word;
+    int32_t applied_cpu;
+    uint32_t state_flags;
+    uint8_t pad1[48];
+};
+static_assert(sizeof(worker_sched_ctrl) == 128, "scheduler command and reply use separate cache lines");
+static_assert(__atomic_always_lock_free(sizeof(uint64_t), nullptr), "scheduler words must be lock-free");
+
 /********** lrpc message types for TCP **********/
 /*** Application ------> Kernel ***/
 enum LRPC_APPOUT_TCP_TYPE
@@ -204,6 +223,7 @@ enum LRPC_APPIN_TCP_TYPE {
     APPIN_TCP_STATUS_CLOSE,
     
     APPIN_TCP_MAX,
+    APPIN_TCP_SCHED_REBIND = 0x100,
 };
 
 // APPIN_TCP_EVENT_NEWCONN

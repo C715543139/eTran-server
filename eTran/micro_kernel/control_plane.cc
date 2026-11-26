@@ -151,9 +151,6 @@ static struct app_ctx *find_actx_with_fd(int fd);
 /* accept and create context for new application */
 static int accept_app(void);
 /* process requests from application */
-static int process_app_req(int fd, struct register_request *req);
-/* reponse application's requests */
-static void response_app_req(int app_fd, enum resp_type type);
 
 /* poll events from Unix domain socket */
 static int poll_uds(int timeout_ms);
@@ -441,7 +438,7 @@ static int reserve_cpu(int type, CpuRole role, int cpu)
     cpuUseRef[cpu]++;
     if (role == CpuRole::Irq)
         ++cpuIrqRefs[cpu];
-    else if (type == THROUGHPUT)
+    else if (type != LATENCY)
         ++cpuThroughputAppRefs[cpu];
     return cpu;
 }
@@ -454,7 +451,7 @@ static void release_app_cpus(struct app_ctx *actx)
         if (slot++ < actx->nr_nic_queues) {
             assert(cpuIrqRefs[cpu] > 0);
             --cpuIrqRefs[cpu];
-        } else if (actx->tcp_type == THROUGHPUT) {
+        } else if (actx->tcp_type != LATENCY) {
             assert(cpuThroughputAppRefs[cpu] > 0);
             --cpuThroughputAppRefs[cpu];
         }
@@ -486,8 +483,8 @@ static int select_cpu(int type, CpuRole role, int requested_app_cpu)
     auto compatible = [&](int cpu) {
         if (role == CpuRole::Irq)
             return cpuThroughputAppRefs[cpu] == 0 &&
-                   (type != THROUGHPUT || cpu != requested_app_cpu);
-        if (type == THROUGHPUT)
+                   (type == LATENCY || cpu != requested_app_cpu);
+        if (type != LATENCY)
             return cpuIrqRefs[cpu] == 0;
         return cpuThroughputAppRefs[cpu] == 0;
     };
@@ -700,6 +697,7 @@ static void free_app_resources(struct app_ctx *actx)
 {
     if (actx->proto == IPPROTO_TCP)
     {
+        scheduler_unregister_workers(actx->generation);
         if (!actx->use_shared_queues) {
             for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
                 scheduler_unregister_queue(actx->nic_qid[i]);
@@ -741,7 +739,8 @@ static void free_app_resources(struct app_ctx *actx)
 
         unregister_slow_path_map(qid, actx->proto);
 
-        etran_nic->_free_exclusive_qids.push_back(qid);
+        auto &owners = etran_nic->_nic_queues[qid].actxs;
+        owners.erase(std::remove(owners.begin(), owners.end(), actx), owners.end());
     }
 
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
@@ -762,6 +761,8 @@ static void free_app_resources(struct app_ctx *actx)
         shm_wrapper_destroy(actx->tctx[i].lrpc);
         close(actx->tctx[i].evfd);
     }
+    for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
+        etran_nic->_free_exclusive_qids.push_back(actx->nic_qid[i]);
 }
 
 static void destroy_all_apps(void)
@@ -807,10 +808,11 @@ static void destroy_app(int fd)
     {
         if ((*it)->fd == fd)
         {
-            if ((*it)->done)
+            if ((*it)->done) {
                 free_app_resources(*it);
+                kill_app((*it)->pid);
+            }
             close(fd);
-            kill_app((*it)->pid);
             active_apps.nr_app--;
             printf("Destroy app_fd: %d\n", fd);
             break;
@@ -833,35 +835,17 @@ static struct app_ctx *find_actx_with_fd(int fd)
     return nullptr;
 }
 
-static void response_app_req(int app_fd, enum resp_type type)
+static void prepare_uds_response(app_ctx &app, UdsState state, resp_type type, int error = 0)
 {
-    struct app_ctx *actx = find_actx_with_fd(app_fd);
-    struct register_response resp = {};
-    assert(actx);
-
-    switch (type)
-    {
-    case REG_XSK_FD:
-        resp.type = type;
-        if (write_all(app_fd, &resp, sizeof(resp)) != sizeof(resp))
-            return;
-        // UMEM fds
-        transfer_fds(app_fd, actx->umem_fd, actx->nr_nic_queues);
-        // TX/RX XSKs
-        for (unsigned int i = 0; i < actx->nr_app_threads; i++)
-            transfer_fds(app_fd, actx->tctx[i].txrx_xsk_fd, actx->nr_nic_queues);
-        break;
-    case REG_CPU_READY:
-    case REG_EVENT_FD:
-        resp.type = type;
-        if (write_all(app_fd, &resp, sizeof(resp)) != sizeof(resp))
-            return;
-        if (type == REG_CPU_READY)
-            break;
-        for (unsigned int i = 0; i < actx->nr_app_threads; i++)
-            transfer_fd(app_fd, actx->tctx[i].evfd);
-        break;
-    case REG_DONE: {
+    app.uds_state = state;
+    app.uds_offset = 0;
+    app.uds_fd_batch = 0;
+    auto &resp = app.uds_resp;
+    resp = {};
+    resp.type = type;
+    resp.err_code = error;
+    if (type == REG_DONE) {
+        const auto *actx = &app;
         resp.shm_bp_size = actx->bpw.shm_bp->size;
         resp.shm_umem_size = actx->bpw.shm_umem->size;
         resp.shm_lrpc_size = actx->tctx[0].lrpc->size;
@@ -879,14 +863,6 @@ static void response_app_req(int app_fd, enum resp_type type)
             idx++;
         };
         #endif
-    }
-    case REG_FAIL:
-    case UNKNWON:
-        resp.type = type;
-        write_all(app_fd, &resp, sizeof(resp));
-        break;
-    default:
-        break;
     }
 }
 
@@ -974,7 +950,8 @@ static inline int init_lrpc_channels(struct app_ctx *actx, const char *lrpc_pref
         // shm_lrpc_name = "LRPC_" + std::to_string(actx->pid) + "_" + std::to_string(i);
         shm_lrpc_name = lrpc_prefix + std::to_string(actx->pid) + "_" + std::to_string(i);
         lrpc_size = (sizeof(struct head_wb) + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE) * 2;
-        actx->tctx[i].lrpc = shm_wrapper_create(shm_lrpc_name, lrpc_size);
+        static_assert(sizeof(head_wb) == 64 && sizeof(lrpc_msg) == 64, "scheduler control alignment");
+        actx->tctx[i].lrpc = shm_wrapper_create(shm_lrpc_name, lrpc_size + sizeof(worker_sched_ctrl));
         if (!actx->tctx[i].lrpc)
         {
             fprintf(stderr, "shm_wrapper_create failed\n");
@@ -986,6 +963,7 @@ static inline int init_lrpc_channels(struct app_ctx *actx, const char *lrpc_pref
 
         channel_1 = app_recv_head_wb + sizeof(struct head_wb);
         channel_2 = channel_1 + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE;
+        actx->tctx[i].sched_ctrl = new (k_recv_head_wb + lrpc_size) worker_sched_ctrl{};
 
         if (lrpc_init_out(&actx->tctx[i].kernel_out, (lrpc_msg *)channel_1, LRPC_CHANNEL_SIZE,
                           (uint32_t *)app_recv_head_wb))
@@ -1059,7 +1037,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
 
 #ifdef ALLOCATION
     if (req.proto == IPPROTO_TCP &&
-        ((req.tcp_type != LATENCY && req.tcp_type != THROUGHPUT) ||
+        ((req.tcp_type != LATENCY && req.tcp_type != THROUGHPUT && req.tcp_type != AUTO) ||
          requested_app_cpu < -1 ||
          (requested_app_cpu >= 0 && !valid_pool_cpu(requested_app_cpu)))) {
         return -EINVAL;
@@ -1308,12 +1286,112 @@ err:
     return -ENOMEM;
 }
 
-static int process_app_req(int fd, struct register_request *req)
+// Return 1 for a complete frame, 0 for a partial frame, or a negative errno.
+static int poll_uds_frame(app_ctx &app, void *buffer, size_t size, bool outgoing)
 {
-    memset(req, 0, sizeof(*req));
-    if (read_all(fd, req, sizeof(*req)) != sizeof(*req))
-        return -1;
+    if (app.uds_offset == size)
+        return 1;
+    auto *next = static_cast<char *>(buffer) + app.uds_offset;
+    ssize_t n = outgoing ? send(app.fd, next, size - app.uds_offset, MSG_NOSIGNAL)
+                         : recv(app.fd, next, size - app.uds_offset, 0);
+    if (n < 0)
+        return errno == EAGAIN || errno == EINTR ? 0 : -errno;
+    if (n == 0)
+        return -ECONNRESET;
+    app.uds_offset += n;
+    return app.uds_offset == size;
+}
 
+static int poll_uds_reply(app_ctx &app)
+{
+    const auto state = app.uds_state;
+    int rc = poll_uds_frame(app, &app.uds_resp, sizeof(app.uds_resp), true);
+    if (rc <= 0)
+        return rc;
+
+    if (state == UdsState::SendXsk && app.uds_fd_batch <= app.nr_app_threads) {
+        const auto batch = app.uds_fd_batch;
+        const auto *fds = batch == 0 ? app.umem_fd : app.tctx[batch - 1].txrx_xsk_fd;
+        rc = transfer_fds(app.fd, fds, app.nr_nic_queues);
+        if (rc)
+            return rc == -EAGAIN || rc == -EINTR ? 0 : rc;
+        ++app.uds_fd_batch;
+        return 0;
+    }
+    if (state == UdsState::SendEvent && app.uds_fd_batch < app.nr_app_threads) {
+        rc = transfer_fds(app.fd, &app.tctx[app.uds_fd_batch].evfd, 1);
+        if (rc)
+            return rc == -EAGAIN || rc == -EINTR ? 0 : rc;
+        ++app.uds_fd_batch;
+        return 0;
+    }
+    switch (state) {
+    case UdsState::SendCpuReady:
+        app.uds_state = UdsState::RecvCpu;
+        app.uds_offset = 0;
+        break;
+    case UdsState::SendXsk:
+        prepare_uds_response(app, UdsState::SendEvent, REG_EVENT_FD);
+        break;
+    case UdsState::SendEvent:
+        prepare_uds_response(app, UdsState::SendDone, REG_DONE);
+        break;
+    case UdsState::SendDone:
+        app.uds_state = UdsState::Ready;
+        app.uds_offset = 0;
+        break;
+    case UdsState::SendError:
+        return -ECONNABORTED;
+    default:
+        return -EINVAL;
+    }
+    return 1;
+}
+
+static bool uds_wants_write(UdsState state)
+{
+    return state != UdsState::RecvRequest && state != UdsState::RecvCpu && state != UdsState::Ready;
+}
+
+static int poll_uds_request(app_ctx &app)
+{
+    if (app.uds_state == UdsState::RecvCpu) {
+        int rc = poll_uds_frame(app, &app.uds_requested_cpu, sizeof(app.uds_requested_cpu), false);
+        if (rc <= 0)
+            return rc;
+    } else {
+        int rc = poll_uds_frame(app, &app.uds_req, sizeof(app.uds_req), false);
+        if (rc <= 0)
+            return rc;
+        if (app.uds_state == UdsState::Ready)
+            return app.uds_req.type == UNREG ? -ECONNABORTED : -EPROTO;
+        if (app.uds_req.type == REG || app.uds_req.type == REG_CPU)
+            return -EPROTONOSUPPORT;
+        if (app.uds_req.type == REG_CPU_V2) {
+            prepare_uds_response(app, UdsState::SendCpuReady, REG_CPU_READY);
+            return 1;
+        }
+        if (app.uds_req.type != REG_V2)
+            return -EPROTO;
+    }
+    const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_requested_cpu);
+    if (error)
+        prepare_uds_response(app, UdsState::SendError, REG_FAIL, error);
+    else
+        prepare_uds_response(app, UdsState::SendXsk, REG_XSK_FD);
+    return 1;
+}
+
+static int update_uds_interest(const app_ctx &app, bool was_writing)
+{
+    const bool writing = uds_wants_write(app.uds_state);
+    if (writing == was_writing)
+        return 0;
+    struct epoll_event ev{};
+    ev.events = (writing ? EPOLLOUT : EPOLLIN) | EPOLLRDHUP;
+    ev.data.u64 = app.generation;
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, app.fd, &ev) < 0)
+        return -errno;
     return 0;
 }
 
@@ -1324,11 +1402,11 @@ static int accept_app(void)
     struct ucred cred;
     socklen_t ucred_len = sizeof(struct ucred);
 
-    new_fd = accept(uds_sockfd, nullptr, nullptr);
+    new_fd = accept4(uds_sockfd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
     if (new_fd < 0)
         return -1;
 
-    if (active_apps.nr_app > MAX_SUPPORT_APP)
+    if (active_apps.nr_app >= MAX_SUPPORT_APP)
         goto err;
 
     app = new app_ctx();
@@ -1346,6 +1424,13 @@ static int accept_app(void)
 
     app->done = false;
     app->fd = new_fd;
+    static uint64_t next_generation = 0;
+    app->generation = ++next_generation;
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLRDHUP;
+    ev.data.u64 = app->generation;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, new_fd, &ev) < 0)
+        goto err;
 
     active_apps.apps.push_back(app);
     active_apps.nr_app++;
@@ -1379,94 +1464,47 @@ int ctx_init(void)
 
 static int poll_uds(int timeout_ms)
 {
-    struct epoll_event ev, events[MAX_SUPPORT_APP + 1];
-    int nfds;
-    int new_fd;
-    struct register_request req;
-
-    nfds = epoll_wait(epfd, events, MAX_SUPPORT_APP + 1, timeout_ms);
+    struct epoll_event events[MAX_SUPPORT_APP + 1];
+    const int nfds = epoll_wait(epfd, events, MAX_SUPPORT_APP + 1, timeout_ms);
 
     if (nfds < 0)
         return -1;
 
     for (int i = 0; i < nfds; i++)
     {
-        if (events[i].data.fd == uds_sockfd)
+        if (events[i].data.u64 == 0)
         {
             if (events[i].events & EPOLLERR)
             {
                 perror("uds_sockfd error");
                 return -1;
             }
-            new_fd = accept_app();
-            if (new_fd < 0)
+            if (accept_app() < 0)
             {
                 perror("accept_app");
-                continue;
             }
-            ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-            ev.data.fd = new_fd;
-            if (epoll_ctl(epfd, EPOLL_CTL_ADD, new_fd, &ev) < 0)
-            {
-                perror("epoll_ctl");
-                continue;
-            }
-            printf("Accepted new app_fd: %d\n", new_fd);
+            continue;
         }
-        else
-        {
-            if (events[i].events & EPOLLHUP || events[i].events & EPOLLERR)
-            {
-                epoll_ctl(epfd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-                destroy_app(events[i].data.fd);
-                continue;
-            }
-            else if (events[i].events & EPOLLIN)
-            {
-                if (process_app_req(events[i].data.fd, &req))
-                {
-                    epoll_ctl(epfd, EPOLL_CTL_DEL, events[i].data.fd, NULL);
-                    destroy_app(events[i].data.fd);
-                    continue;
-                }
-                switch (req.type)
-                {
-                case REG:
-                case REG_CPU: {
-                    int requested_app_cpu = -1;
-                    if (req.type == REG_CPU) {
-                        response_app_req(events[i].data.fd, REG_CPU_READY);
-                        if (read_all(events[i].data.fd, &requested_app_cpu, sizeof(requested_app_cpu)) != sizeof(requested_app_cpu)) {
-                            epoll_ctl(epfd, EPOLL_CTL_DEL, events[i].data.fd, nullptr);
-                            destroy_app(events[i].data.fd);
-                            break;
-                        }
-                    }
-                    printf("Receive REG command for app_fd:%d\n", events[i].data.fd);
-                    if (alloc_app_resources(req, events[i].data.fd, requested_app_cpu))
-                    {
-                        fprintf(stderr, "alloc_app_resources failed\n");
-                        response_app_req(events[i].data.fd, REG_FAIL);
-                    }
-                    else
-                    {
-                        response_app_req(events[i].data.fd, REG_XSK_FD);
-                        response_app_req(events[i].data.fd, REG_EVENT_FD);
-                        response_app_req(events[i].data.fd, REG_DONE);
-                    }
-                    break;
-                }
-                case UNREG:
-                    printf("Receive UNREG command for app_fd:%d\n", events[i].data.fd);
-                    destroy_app(events[i].data.fd);
-                    break;
-                default:
-                    printf("Receive UNKNWON command for app_fd:%d\n", events[i].data.fd);
-                    response_app_req(events[i].data.fd, UNKNWON);
-                    break;
-                }
-            }
+        const auto generation = events[i].data.u64;
+        auto it = std::find_if(active_apps.apps.begin(), active_apps.apps.end(), [generation](const auto *app) {
+            return app->generation == generation;
+        });
+        if (it == active_apps.apps.end())
+            continue;
+        auto &app = **it;
+        const auto flags = events[i].events;
+        const bool writing = uds_wants_write(app.uds_state);
+        if (flags & (EPOLLERR | EPOLLHUP | EPOLLRDHUP)) {
+            destroy_app(app.fd);
+            continue;
         }
+        int rc = 0;
+        if (writing && (flags & EPOLLOUT))
+            rc = poll_uds_reply(app);
+        else if (!writing && (flags & EPOLLIN))
+            rc = poll_uds_request(app);
+        if (rc < 0 || update_uds_interest(app, writing))
+            destroy_app(app.fd);
     }
     return 0;
 }
@@ -1486,7 +1524,7 @@ static void *control_loop(void *arg)
     }
 
     ev.events = EPOLLIN | EPOLLERR;
-    ev.data.fd = uds_sockfd;
+    ev.data.u64 = 0;
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, uds_sockfd, &ev) < 0)
     {
         perror("epoll_ctl");
@@ -1795,10 +1833,21 @@ static void process_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
         appout_tcp_worker_tid_t identity;
         memcpy(&identity, msg_in->data, sizeof(identity));
         const auto *app = tctx->actx;
-        if (app->proto == IPPROTO_TCP && !app->use_shared_queues && app->nr_app_threads == 1 &&
-            identity.worker_idx == 0 && tctx == app->tctx && identity.os_tid > 0) {
-            for (unsigned int i = 0; i < app->nr_nic_queues; ++i)
-                scheduler_register_worker(app->nic_qid[i], app->pid, identity.os_tid);
+        if (app->proto == IPPROTO_TCP && identity.worker_idx < app->nr_app_threads &&
+            tctx == &app->tctx[identity.worker_idx] && identity.os_tid > 0) {
+            const auto task = "/proc/" + std::to_string(app->pid) + "/task/" +
+                              std::to_string(identity.os_tid);
+            if (access(task.c_str(), F_OK) == 0) {
+                tctx->os_tid = identity.os_tid;
+#ifdef ALLOCATION
+                auto cpu = app->usedCores.begin();
+                std::advance(cpu, app->nr_nic_queues + identity.worker_idx);
+                scheduler_register_worker_slot(app->generation, identity.worker_idx, *cpu, app->tcp_type);
+#endif
+                if (!app->use_shared_queues && app->nr_app_threads == 1)
+                    for (unsigned int i = 0; i < app->nr_nic_queues; ++i)
+                        scheduler_register_worker(app->nic_qid[i], app->pid, identity.os_tid);
+            }
         }
         break;
     }

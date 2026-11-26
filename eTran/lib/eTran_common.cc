@@ -49,6 +49,19 @@ static inline struct app_ctx_per_thread *alloc_tctx(void)
     const auto idx = tctx_id++;
     auto *worker = &actx->tctx[idx];
     if (actx->proto == IPPROTO_TCP) {
+#ifdef ALLOCATION
+        cpu_set_t cpus;
+        CPU_ZERO(&cpus);
+        CPU_SET(tcp_state.cpus[idx], &cpus);
+        if (sched_setaffinity(0, sizeof(cpus), &cpus)) {
+            fprintf(stderr, "Cannot pin eTran worker %u to CPU %d: %s\n", idx,
+                    tcp_state.cpus[idx], strerror(errno));
+            worker->sched_ctrl = nullptr;
+            return worker;
+        }
+        if (worker->sched_ctrl)
+            __atomic_store_n(&worker->sched_ctrl->applied_cpu, tcp_state.cpus[idx], __ATOMIC_RELAXED);
+#endif
         lrpc_msg message{};
         message.cmd = APPOUT_TCP_WORKER_TID;
         const appout_tcp_worker_tid_t identity{idx, static_cast<int32_t>(syscall(SYS_gettid))};
@@ -342,10 +355,14 @@ static int _resource_free(void)
  * @param shm_lrpc_name_base base name of shared memory for lrpc
  * @param shm_lrpc_size size of shared memory for each lrpc channel
  */
-static inline int init_lrpc_channels(std::string &shm_lrpc_name_base, size_t shm_lrpc_size)
+static inline int init_lrpc_channels(std::string &shm_lrpc_name_base, size_t shm_lrpc_size,
+                                     bool cooperative)
 {
     char *k_recv_head_wb, *app_recv_head_wb;
     char *channel_1, *channel_2;
+    constexpr size_t ctrl_offset = (sizeof(head_wb) + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE) * 2;
+    if (shm_lrpc_size != ctrl_offset + sizeof(worker_sched_ctrl))
+        return -EPROTO;
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
     {
         std::string shm_lrpc_name = shm_lrpc_name_base + "_" + std::to_string(i);
@@ -361,6 +378,8 @@ static inline int init_lrpc_channels(std::string &shm_lrpc_name_base, size_t shm
 
         channel_1 = app_recv_head_wb + sizeof(struct head_wb);
         channel_2 = channel_1 + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE;
+        if (cooperative)
+            actx->tctx[i].sched_ctrl = reinterpret_cast<worker_sched_ctrl *>(k_recv_head_wb + ctrl_offset);
 
         if (lrpc_init_in(&actx->tctx[i].app_in, (lrpc_msg *)channel_1, LRPC_CHANNEL_SIZE, (uint32_t *)app_recv_head_wb))
         {
@@ -494,7 +513,7 @@ int eTran_init(struct eTran_cfg *cfg)
     actx->pid = cred.pid;
 
     /* craft register request */
-    req.type = requested_app_cpu >= 0 ? REG_CPU : REG;
+    req.type = requested_app_cpu >= 0 ? REG_CPU_V2 : REG_V2;
     req.proto = cfg->proto;
     req.nr_nic_queues = cfg->nr_nic_queues;
     req.nr_app_threads = cfg->nr_app_threads;
@@ -506,8 +525,12 @@ int eTran_init(struct eTran_cfg *cfg)
             req.tcp_type=LATENCY;
         } else if (cfg->tcp_type==ETRAN_TCP_THROUGHPUT) {
             req.tcp_type=THROUGHPUT;
+        } else if (cfg->tcp_type == ETRAN_TCP_AUTO) {
+            req.tcp_type = AUTO;
         } else {
-            assert(0);
+            delete actx;
+            actx = nullptr;
+            return -EINVAL;
         }
     } else {
         req.tcp_type = HOMA; // Homa does not use tcp_type
@@ -517,7 +540,7 @@ int eTran_init(struct eTran_cfg *cfg)
     if (write_all(actx->fd, &req, sizeof(req)) != sizeof(req))
         return -EIO;
 
-    if (req.type == REG_CPU) {
+    if (req.type == REG_CPU_V2) {
         if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp))
             return -EIO;
         if (resp.type != REG_CPU_READY)
@@ -527,8 +550,15 @@ int eTran_init(struct eTran_cfg *cfg)
     }
 
     /* receive AF_XDP socket fds, including control path fds and data path fds */
-    if (read_all(actx->fd, &resp, sizeof(resp)) < 0 || resp.type != REG_XSK_FD)
+    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp))
         return -EIO;
+    if (resp.type == REG_FAIL) {
+        delete actx;
+        actx = nullptr;
+        return resp.err_code < 0 ? resp.err_code : -EIO;
+    }
+    if (resp.type != REG_XSK_FD)
+        return -EPROTONOSUPPORT;
     
     if (receive_fds(actx->fd, actx->umem_fd, actx->nr_nic_queues))
         return -EIO;
@@ -538,7 +568,7 @@ int eTran_init(struct eTran_cfg *cfg)
             return -EIO;
 
     /* receive event fds for lrpc channel */
-    if (read_all(actx->fd, &resp, sizeof(resp)) < 0 || resp.type != REG_EVENT_FD)
+    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp) || resp.type != REG_EVENT_FD)
         return -EIO;
 
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
@@ -562,7 +592,7 @@ int eTran_init(struct eTran_cfg *cfg)
     }
 
     /* receive shared memory and NIC queue information */
-    if (read_all(actx->fd, &resp, sizeof(resp)) < 0 || resp.type != REG_DONE)
+    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp) || resp.type != REG_DONE)
         return -EIO;
 
 #ifdef ALLOCATION
@@ -633,7 +663,7 @@ int eTran_init(struct eTran_cfg *cfg)
 
     actx->bpw.bp = reinterpret_cast<struct buffer_pool *>(actx->bpw.shm_bp->addr);
 
-    if (init_lrpc_channels(shm_lrpc_name, shm_lrpc_size))
+    if (init_lrpc_channels(shm_lrpc_name, shm_lrpc_size, resp.sched_cooperative != 0))
         goto err;
 
     if (resource_alloc())
@@ -778,8 +808,9 @@ void pre_main(int argc, char *argv[])
 #if defined (ALLOCATION)
             std::cout<<"Perf Isolation enabled!"<<std::endl;
             const char* proto_env_usage = std::getenv("ETRAN_TCP_TYPE");
-            // const char* proto_env_usage = "THROUGHPUT";
-            if (strcmp(proto_env_usage,"LATENCY") == 0) {
+            if (!proto_env_usage || strcmp(proto_env_usage, "AUTO") == 0) {
+                cfg.tcp_type = ETRAN_TCP_AUTO;
+            } else if (strcmp(proto_env_usage,"LATENCY") == 0) {
                 cfg.tcp_type = ETRAN_TCP_LATENCY;
             } else if (strcmp(proto_env_usage,"THROUGHPUT") == 0) {
                 cfg.tcp_type = ETRAN_TCP_THROUGHPUT;
