@@ -436,6 +436,18 @@ extern "C" int pthread_create(pthread_t *thread, const pthread_attr_t *attr, voi
 }
 #endif
 
+static int read_register_response(int fd, register_response &response)
+{
+    if (read_all(fd, &response.type, sizeof(response.type)) != sizeof(response.type))
+        return -EIO;
+    // An older peer replies UNKNWON with a shorter message.
+    if (response.type == UNKNWON)
+        return -EPROTONOSUPPORT;
+    auto *body = reinterpret_cast<char *>(&response) + sizeof(response.type);
+    const auto size = sizeof(response) - sizeof(response.type);
+    return read_all(fd, body, size) == size ? 0 : -EIO;
+}
+
 int eTran_init(struct eTran_cfg *cfg)
 {
     struct epoll_event ev;
@@ -541,8 +553,8 @@ int eTran_init(struct eTran_cfg *cfg)
         return -EIO;
 
     if (req.type == REG_CPU_V2) {
-        if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp))
-            return -EIO;
+        if (int rc = read_register_response(actx->fd, resp))
+            return rc;
         if (resp.type != REG_CPU_READY)
             return -EPROTONOSUPPORT;
         if (write_all(actx->fd, &requested_app_cpu, sizeof(requested_app_cpu)) != sizeof(requested_app_cpu))
@@ -550,8 +562,8 @@ int eTran_init(struct eTran_cfg *cfg)
     }
 
     /* receive AF_XDP socket fds, including control path fds and data path fds */
-    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp))
-        return -EIO;
+    if (int rc = read_register_response(actx->fd, resp))
+        return rc;
     if (resp.type == REG_FAIL) {
         delete actx;
         actx = nullptr;
@@ -568,7 +580,7 @@ int eTran_init(struct eTran_cfg *cfg)
             return -EIO;
 
     /* receive event fds for lrpc channel */
-    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp) || resp.type != REG_EVENT_FD)
+    if (read_register_response(actx->fd, resp) || resp.type != REG_EVENT_FD)
         return -EIO;
 
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
@@ -592,7 +604,7 @@ int eTran_init(struct eTran_cfg *cfg)
     }
 
     /* receive shared memory and NIC queue information */
-    if (read_all(actx->fd, &resp, sizeof(resp)) != sizeof(resp) || resp.type != REG_DONE)
+    if (read_register_response(actx->fd, resp) || resp.type != REG_DONE)
         return -EIO;
 
 #ifdef ALLOCATION

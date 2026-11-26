@@ -36,9 +36,12 @@ struct Settings {
     const char *qid = std::getenv("ETRAN_QID_STATS");
     const char *probe = std::getenv("ETRAN_SOFTIRQ_PROBE");
     const char *verbose_flag = std::getenv("ETRAN_SCHED_VERBOSE");
+    const char *sample_flag = std::getenv("ETRAN_QID_STATS_SAMPLE");
     bool shadow = mode && strcmp(mode, "shadow") == 0;
+    bool admit_only = mode && strcmp(mode, "admit_only") == 0;
+    bool sample = !sample_flag || strcmp(sample_flag, "0") != 0;
     bool probe_enabled = probe && strcmp(probe, "1") == 0;
-    bool qid_enabled = shadow || (qid && strcmp(qid, "1") == 0);
+    bool qid_enabled = shadow || admit_only || (qid && strcmp(qid, "1") == 0);
     bool verbose = shadow || (verbose_flag && strcmp(verbose_flag, "1") == 0);
 };
 
@@ -127,6 +130,7 @@ struct Registration {
 };
 
 enum class Profile { Unknown, Idle, Light, Heavy };
+std::array<Profile, MAX_NIC_QUEUES> last_profiles{};
 
 const char *profile_name(Profile state)
 {
@@ -499,6 +503,14 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
         }
         if (settings().shadow)
             report_shadow(snapshot, queue_state, worker_snapshot, pool);
+        {
+            std::lock_guard<std::mutex> lock(registration_mutex);
+            for (unsigned qid = 0; qid < queues; ++qid)
+                if (snapshot[qid].generation == registrations[qid].generation &&
+                    snapshot[qid].pid && registrations[qid].pid)
+                    last_profiles[qid] = queue_state[qid].sampled && !queue_state[qid].drops && !progress[qid].stalled
+                                         ? queue_state[qid].profile : Profile::Unknown;
+        }
         if (have_probe)
             last_probe.swap(softirq);
         if (have_counts)
@@ -514,6 +526,12 @@ bool scheduler_collect_qid_stats()
     return settings().qid_enabled;
 }
 
+bool scheduler_queue_is_light(unsigned int qid)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    return registrations[qid].pid && (last_profiles[qid] == Profile::Light || last_profiles[qid] == Profile::Idle);
+}
+
 void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, int app_cpu)
 {
     if (!scheduler_collect_qid_stats())
@@ -521,6 +539,7 @@ void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, i
     std::lock_guard<std::mutex> lock(registration_mutex);
     auto &entry = registrations[qid];
     entry = {entry.generation + 1, pid, slo, irq_cpu, app_cpu};
+    last_profiles[qid] = Profile::Unknown;
 }
 
 void scheduler_unregister_queue(unsigned int qid)
@@ -584,8 +603,8 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
                     int tw_pending_fd, const bpf_cc_map_user *cc)
 {
     const auto &config = settings();
-    if (config.mode && strcmp(config.mode, "off") && !config.shadow) {
-        fprintf(stderr, "ETRAN_SCHED_MODE must be off or shadow during telemetry validation\n");
+    if (config.mode && strcmp(config.mode, "off") && !config.shadow && !config.admit_only) {
+        fprintf(stderr, "ETRAN_SCHED_MODE must be off, shadow, or admit_only\n");
         return -EINVAL;
     }
     if (config.probe_enabled && !config.qid_enabled) {
@@ -594,6 +613,13 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
     }
     if (!config.qid_enabled && !config.probe_enabled)
         return 0;
+    if (!config.sample) {
+        if (config.shadow || config.admit_only || config.probe_enabled) {
+            fprintf(stderr, "ETRAN_QID_STATS_SAMPLE=0 is only for counters-only off-mode comparisons\n");
+            return -EINVAL;
+        }
+        return 0;
+    }
     Thresholds limits;
     if (!limits.load()) {
         fprintf(stderr, "Scheduler high thresholds must exceed low thresholds; softirq ratios must be in [0, 1]\n");
@@ -650,7 +676,7 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
     }
     if (config.verbose)
         fprintf(stderr, "sched_start mode=%s cpu=%d qid=%d softirq=%d\n",
-                config.shadow ? "shadow" : "off", cpu, config.qid_enabled, config.probe_enabled);
+                config.mode ? config.mode : "off", cpu, config.qid_enabled, config.probe_enabled);
     return 0;
 }
 

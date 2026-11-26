@@ -96,6 +96,8 @@ std::vector<int> throughputUsingCores;
 int cpuUseRef[MAX_CPU]={0}, cpuLatUseRef[MAX_CPU]={0};//一个cpu被lat使用了之后就不会再分配给throughput使用
 static int cpuIrqRefs[MAX_CPU];
 static int cpuThroughputAppRefs[MAX_CPU];
+static bool scheduler_admission = false;
+static bool scheduler_degrade = false;
 enum class CpuRole { Irq, App };
 static int cpuUsage[MAX_CPU]={0};//CPU利用率，80%在这里表示为80
 static std::array<std::atomic<int>, MAX_CPU> cpu_usage_sample{};
@@ -596,6 +598,72 @@ static int allocate_cpu(const app_ctx *actx, CpuRole role, int requested_cpu)
     return cpu < 0 ? cpu : reserve_cpu(actx->tcp_type, role, cpu);
 }
 
+static int place_new_tcp_app(app_ctx &app, int fixed_irq)
+{
+    auto free = availableCores;
+    std::vector<int> irq_cpus, app_cpus;
+    bool degraded = false;
+    auto take = [&free](int fixed, bool irq) {
+        if (fixed >= 0) {
+            free.erase(fixed);
+            return fixed;
+        }
+        if (free.empty())
+            return -1;
+        const int cpu = irq ? *free.begin() : *free.rbegin();
+        free.erase(cpu);
+        return cpu;
+    };
+
+    // Exclude an explicit IRQ target before choosing an unpinned APP slot.
+    if (fixed_irq >= 0)
+        free.erase(fixed_irq);
+    for (unsigned i = 0; i < app.nr_app_threads; ++i) {
+        const int cpu = take(app.requested_app_cpu, false);
+        if (cpu < 0)
+            return -ENOSPC;
+        app_cpus.push_back(cpu);
+    }
+    for (unsigned i = 0; i < app.nr_nic_queues; ++i) {
+        int cpu = take(fixed_irq, true);
+        if (cpu < 0 && app.nr_nic_queues == 1 && app.nr_app_threads == 1) {
+            const int app_cpu = app_cpus.front();
+            if ((app.tcp_type == LATENCY || app.tcp_type == AUTO) && !cpuUseRef[app_cpu])
+                cpu = app_cpu;
+            if (app.tcp_type == THROUGHPUT) {
+                // The LAT-first three-core transient is limited to an unstacked IRQ-only LAT core.
+                for (const auto *other : active_apps.apps) {
+                    if (!other->done || other->proto != IPPROTO_TCP || other->use_shared_queues ||
+                        other->tcp_type != LATENCY || other->nr_nic_queues != 1 || other->nr_app_threads != 1)
+                        continue;
+                    const int candidate = other->usedCores.front();
+                    if (candidate == app_cpu || cpuUseRef[candidate] != 1 || cpuIrqRefs[candidate] != 1)
+                        continue;
+                    if (other->ports.empty() || scheduler_queue_is_light(other->nic_qid[0])) {
+                        cpu = candidate;
+                        break;
+                    }
+                }
+                if (cpu < 0 && scheduler_degrade && !cpuUseRef[app_cpu]) {
+                    cpu = app_cpu;
+                    degraded = true;
+                }
+            }
+        }
+        if (cpu < 0)
+            return -ENOSPC;
+        irq_cpus.push_back(cpu);
+    }
+    for (int cpu : irq_cpus)
+        app.usedCores.push_back(reserve_cpu(app.tcp_type, CpuRole::Irq, cpu));
+    for (int cpu : app_cpus)
+        app.usedCores.push_back(reserve_cpu(app.tcp_type, CpuRole::App, cpu));
+    if (degraded)
+        fprintf(stderr, "sched_admission app_gen=%llu state=DEGRADED reason=tp_self_fold\n",
+                static_cast<unsigned long long>(app.generation));
+    return 0;
+}
+
 static int bind_rss_core(struct app_ctx *actx, const std::vector<unsigned int> &qids, bool deferred) {
     int irq_cpu = -1;
     const char *fixed_cpu = std::getenv(actx->tcp_type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
@@ -606,6 +674,20 @@ static int bind_rss_core(struct app_ctx *actx, const std::vector<unsigned int> &
         if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= MAX_CPU || !valid_pool_cpu(cpu))
             return -EINVAL;
         irq_cpu = cpu;
+    }
+    if (scheduler_admission && deferred) {
+        if (int rc = place_new_tcp_app(*actx, irq_cpu))
+            return rc;
+        auto cpu = actx->usedCores.begin();
+        for (auto qid : qids) {
+            printf("CPU allocation pid=%d role=IRQ queue=%u cpu=%d refs=%d latency_refs=%d\n",
+                   actx->pid, qid, *cpu, cpuUseRef[*cpu], cpuLatUseRef[*cpu]);
+            ++cpu;
+        }
+        for (unsigned i = 0; cpu != actx->usedCores.end(); ++i, ++cpu)
+            printf("CPU allocation pid=%d role=APP thread=%u cpu=%d refs=%d latency_refs=%d\n",
+                   actx->pid, i, *cpu, cpuUseRef[*cpu], cpuLatUseRef[*cpu]);
+        return 0;
     }
     if (irq_cpu < 0 || actx->requested_app_cpu < 0)
         for (int cpu : etran_nic->_cpu_topology.pool)
@@ -787,10 +869,10 @@ static int register_xsk_map(int xsk_fd, int xsk_map_key, int proto)
         return -EINVAL;
     }
 
-    if (bpf_map_update_elem(xsk_map_fd, &xsk_map_key, &xsk_fd, BPF_NOEXIST) == EEXIST)
-    {
-        fprintf(stderr, "ERROR: xsk map key %d already exists\n", xsk_map_key);
-        return -EEXIST;
+    if (bpf_map_update_elem(xsk_map_fd, &xsk_map_key, &xsk_fd, BPF_NOEXIST)) {
+        const int error = errno;
+        fprintf(stderr, "ERROR: cannot register XSK map key %d: %s\n", xsk_map_key, strerror(error));
+        return error ? -error : -EIO;
     }
 
     if (proto == IPPROTO_HOMA)
@@ -872,6 +954,7 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
 
     actx->ports.clear();
 
+    bpf_map_delete_elem(etran_entrance->_umem_id_tran_map_fd, &actx->umem_id);
     bp_free(&actx->bpw);
 
     for (unsigned int i = 0; i < actx->nr_app_threads; i++) {
@@ -1129,10 +1212,8 @@ static inline int init_lrpc_channels(struct app_ctx *actx, const char *lrpc_pref
     return 0;
 
 err:
-    for (unsigned int i = 0; i < actx->nr_app_threads; i++)
-        shm_wrapper_destroy(actx->tctx[i].lrpc);
-
-    return -ENOMEM;
+    // The registration owner closes even partially initialized channels.
+    return -EIO;
 }
 
 static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, std::vector<unsigned int> &qids) {
@@ -1173,6 +1254,10 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     struct xdp_options xdp_opts = {0};
     socklen_t optlen = sizeof(xdp_opts);
     int tran_idx;
+    bool umem_registered = false;
+    std::array<bool, MAX_NIC_QUEUES> ctrl_registered{};
+    std::array<unsigned int, MAX_APP_THREADS> registered_data{};
+    int error = -ENOMEM;
 
     if (req.nr_app_threads == 0 || req.nr_app_threads > MAX_APP_THREADS ||
         req.nr_nic_queues == 0 || req.nr_nic_queues > etran_nic->_num_queues)
@@ -1240,20 +1325,31 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     actx->proto = req.proto;
     actx->nr_nic_queues = req.nr_nic_queues;
     actx->nr_app_threads = req.nr_app_threads;
+    actx->use_shared_queues = req.queue_usage == Q_SHARED;
+    std::copy(qids.begin(), qids.end(), actx->nic_qid);
+    for (unsigned i = 0; i < req.nr_app_threads; ++i) {
+        actx->tctx[i].evfd = -1;
+        std::fill_n(actx->tctx[i].txrx_xsk_fd, req.nr_nic_queues, -1);
+    }
 #if defined(ALLOCATION)
     actx->tcp_type = req.tcp_type;
     actx->usedCores = std::list<int>();
     actx->requested_app_cpu = requested_app_cpu;
+    if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
+        if (int rc = bind_rss_core(actx, qids, true)) {
+            return_resources(*actx);
+            return rc;
+        }
+    }
 #endif
 
-    if (init_lrpc_channels(actx, SHM_LRPC_PREFIX))
+    if (int rc = init_lrpc_channels(actx, SHM_LRPC_PREFIX))
     {
         fprintf(stderr, "init_lrpc_channels failed\n");
+        error = rc;
         goto err;
     }
     printf("init_lrpc_channels success\n");
-
-    actx->use_shared_queues = req.queue_usage == Q_SHARED;
 
     if (actx->use_shared_queues && etran_nic->_shared_queues_ready) {
         // Use shared BP
@@ -1325,6 +1421,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
             xsk_fd = socket(AF_XDP, SOCK_RAW, 0);
             if (xsk_fd < 0)
                 goto err;
+            actx->tctx[i].txrx_xsk_fd[j] = xsk_fd;
 
             if (setsockopt(xsk_fd, SOL_SOCKET, SO_BINDTODEVICE, etran_entrance->_ebpf.if_name.c_str(),
                            strlen(etran_entrance->_ebpf.if_name.c_str())))
@@ -1337,7 +1434,6 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
                 apply_socket_busy_poll(xsk_fd);
             }
 
-            actx->tctx[i].txrx_xsk_fd[j] = xsk_fd;
         }
     }
     printf("init TX/RX XSKs success\n");
@@ -1350,6 +1446,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     {
         goto err;
     }
+    umem_registered = true;
     printf("init UMEM and transport mapping success\n");
 
     for (unsigned int i = 0; i < req.nr_nic_queues; i++)
@@ -1359,11 +1456,11 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
 
         if (register_xsk_map(xsk_socket__fd(etran_nic->_nic_queues[qid].xsk_info->xsk), etran_nic->_nic_queues[qid].xsk_map_key, actx->proto))
             goto err;
+        ctrl_registered[i] = true;
+        etran_nic->_available_xsk_keys.erase(etran_nic->_available_xsk_keys.begin());
 
         if (register_slow_path_map(qid, etran_nic->_nic_queues[qid].xsk_map_key, actx->proto))
             goto err;
-
-        etran_nic->_available_xsk_keys.erase(etran_nic->_available_xsk_keys.begin());
     }
     printf("register XSK map for slowpath success\n");
 
@@ -1374,6 +1471,7 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
             actx->tctx[i].txrx_xsk_map_key[j] = etran_nic->_available_xsk_keys.front();
             if (register_xsk_map(actx->tctx[i].txrx_xsk_fd[j], actx->tctx[i].txrx_xsk_map_key[j], actx->proto))
                 goto err;
+            ++registered_data[i];
             etran_nic->_available_xsk_keys.erase(etran_nic->_available_xsk_keys.begin());
         }
     }
@@ -1386,10 +1484,6 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
         RssJob job{actx->generation, 0, {}};
 #ifdef ALLOCATION
-        if (int error = bind_rss_core(actx, qids, true)) {
-            free_app_resources(actx);
-            return error;
-        }
         auto cpu = actx->usedCores.begin();
         for (auto qid : qids)
             job.placement.emplace_back(qid, *cpu++);
@@ -1410,10 +1504,16 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     return 0;
 
 err:
-    for (unsigned int i = 0; i < req.nr_app_threads; i++)
-        for (unsigned int j = 0; j < req.nr_nic_queues; j++)
-            if (actx->tctx[i].txrx_xsk_fd[j])
+    for (unsigned int i = 0; i < req.nr_app_threads; i++) {
+        for (unsigned int j = 0; j < req.nr_nic_queues; j++) {
+            if (j < registered_data[i])
+                unregister_xsk_map(actx->tctx[i].txrx_xsk_fd[j], actx->tctx[i].txrx_xsk_map_key[j], actx->proto);
+            if (actx->tctx[i].txrx_xsk_fd[j] >= 0)
                 close(actx->tctx[i].txrx_xsk_fd[j]);
+        }
+    }
+    if (umem_registered && !actx->use_shared_queues)
+        bpf_map_delete_elem(etran_entrance->_umem_id_tran_map_fd, &actx->umem_id);
 
     for (unsigned int i = 0; i < req.nr_nic_queues; i++)
     {
@@ -1422,8 +1522,16 @@ err:
             fprintf(stderr, "TODO: How to deal with a shared queue?\n");
             continue;
         }
-        if (etran_nic->_nic_queues[qid].xsk_info)
-            xsk_delete_socket(etran_nic->_nic_queues[qid].xsk_info);
+        auto *xsk_info = etran_nic->_nic_queues[qid].xsk_info;
+        if (xsk_info) {
+            const int fd = xsk_socket__fd(xsk_info->xsk);
+            epoll_ctl(xsk_epfd, EPOLL_CTL_DEL, fd, nullptr);
+            if (ctrl_registered[i]) {
+                unregister_slow_path_map(qid, actx->proto);
+                unregister_xsk_map(fd, etran_nic->_nic_queues[qid].xsk_map_key, actx->proto);
+            }
+            xsk_delete_socket(xsk_info);
+        }
         auto it = std::find(etran_nic->_nic_queues[qid].actxs.begin(), etran_nic->_nic_queues[qid].actxs.end(), actx);
         if (it != etran_nic->_nic_queues[qid].actxs.end()) {
             etran_nic->_nic_queues[qid].actxs.erase(it);
@@ -1431,15 +1539,18 @@ err:
         etran_nic->_nic_queues[qid].xsk_info = nullptr;
         etran_nic->_nic_queues[qid].bpw = nullptr;
         etran_nic->_nic_queues[qid].xsk_map_key = 0;
-        etran_nic->_free_exclusive_qids.push_back(qid);
     }
 
     bp_free(&actx->bpw);
 
-    for (unsigned int i = 0; i < req.nr_app_threads; i++)
+    for (unsigned int i = 0; i < req.nr_app_threads; i++) {
         shm_wrapper_destroy(actx->tctx[i].lrpc);
+        if (actx->tctx[i].evfd >= 0)
+            close(actx->tctx[i].evfd);
+    }
 
-    return -ENOMEM;
+    return_resources(*actx);
+    return error;
 }
 
 // Return 1 for a complete frame, 0 for a partial frame, or a negative errno.
@@ -1823,6 +1934,16 @@ int thread_init(void)
 {
     const auto &topology = etran_nic->_cpu_topology;
 #ifdef ALLOCATION
+    const char *mode = std::getenv("ETRAN_SCHED_MODE");
+    const char *enable = std::getenv("ETRAN_ADMISSION_ENABLE");
+    const char *policy = std::getenv("ETRAN_ADMISSION_POLICY");
+    if ((enable && strcmp(enable, "0") && strcmp(enable, "1")) ||
+        (policy && strcmp(policy, "reject") && strcmp(policy, "degrade"))) {
+        fprintf(stderr, "Invalid scheduler admission configuration\n");
+        return -EINVAL;
+    }
+    scheduler_admission = (mode && strcmp(mode, "admit_only") == 0) || (enable && strcmp(enable, "1") == 0);
+    scheduler_degrade = policy && strcmp(policy, "degrade") == 0;
     latUsingCores.clear();
     throughputUsingCores.clear();
     availableCores.clear();

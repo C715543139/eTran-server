@@ -6,6 +6,7 @@ struct CpuTopology;
 struct bpf_cc_map_user;
 
 bool scheduler_collect_qid_stats();
+bool scheduler_queue_is_light(unsigned int qid);
 int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_fd, int tw_fd,
                     int tw_pending_fd, const bpf_cc_map_user *cc);
 void stop_scheduler();
