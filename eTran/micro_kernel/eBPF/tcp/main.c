@@ -235,9 +235,9 @@ int xdp_egress_prog(struct xdp_md *ctx)
 
     if (ret == XDP_REDIRECT) {
         if (qid_stats_enabled) {
-            struct bpf_qid_stats *stats = qid_stats(ctx->rx_queue_index);
-            if (stats)
-                ++stats->tw_enq_attempts;
+            __u32 qid = ctx->rx_queue_index;
+            if (qid < MAX_NIC_QUEUES)
+                ++qid_napi_stats[qid].tw_enq_attempts;
         }
         kick_tw();
         return ret;
@@ -252,10 +252,10 @@ int xdp_egress_prog(struct xdp_md *ctx)
     xdp_egress_dump_tcp(tcph);
     #endif
     if (qid_stats_enabled && ret == XDP_TX) {
-        struct bpf_qid_stats *stats = qid_stats(ctx->rx_queue_index);
-        if (stats) {
-            ++stats->tx_direct_pkts;
-            stats->tx_direct_bytes += ctx->data_end - ctx->data;
+        __u32 qid = ctx->rx_queue_index;
+        if (qid < MAX_NIC_QUEUES) {
+            ++qid_napi_stats[qid].tx_direct_pkts;
+            qid_napi_stats[qid].tx_direct_bytes += ctx->data_end - ctx->data;
         }
     }
     return XDP_TX;
@@ -378,12 +378,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
     barrier_var(qid);
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         ret = bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
-        if (qid_stats_enabled && ret == XDP_REDIRECT) {
-            struct bpf_qid_stats *stats = qid_stats(qid);
-            if (stats) {
-                ++stats->rx_xsk_pkts;
-                stats->rx_xsk_bytes += pkt_len;
-            }
+        barrier_var(qid);
+        if (qid_stats_enabled && ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES) {
+            ++qid_napi_stats[qid].rx_xsk_pkts;
+            qid_napi_stats[qid].rx_xsk_bytes += pkt_len;
         }
         return ret;
     }

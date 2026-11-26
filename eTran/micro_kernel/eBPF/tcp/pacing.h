@@ -161,8 +161,12 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
         return 0;
     tw_map = (struct bpf_map *)tw;
 
-    if (!pkt_queue_pending(tw_map))
+    if (!pkt_queue_pending(tw_map)) {
+        barrier_var(cpu);
+        if (qid_stats_enabled && cpu < MAX_CPU)
+            tw_pending_by_cpu[cpu] = 0;
         return 0;
+    }
     now = bpf_ktime_get_ns();
     
     bool cont = false;
@@ -176,10 +180,10 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
             continue;
         }
 
-        struct bpf_qid_stats *stats = NULL;
+        struct bpf_qid_tw_stats *stats = NULL;
         __u32 frame_len = 0;
         if (qid_stats_enabled) {
-            stats = qid_stats(xdpf->queue_index);
+            stats = qid_tw_stats(xdpf->queue_index);
             frame_len = xdpf->len;
         }
 
@@ -219,7 +223,11 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
     if (submitted)
         bpf_packet_flush();
 
-    if (pkt_queue_pending(tw_map))
+    bool pending = pkt_queue_pending(tw_map);
+    barrier_var(cpu);
+    if (qid_stats_enabled && cpu < MAX_CPU)
+        tw_pending_by_cpu[cpu] = pending;
+    if (pending)
         kick_tw();
 
     return 0;    

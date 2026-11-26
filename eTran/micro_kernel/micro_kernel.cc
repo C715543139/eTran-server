@@ -282,7 +282,9 @@ int main(int argc, char *argv[])
     }
     printf("[Step%d] eBPF init done.\n", ++init_step);
 
-    if (start_scheduler(topology, etran_nic->_num_queues, etran_tcp->qid_stats_fd))
+    if (start_scheduler(topology, etran_nic->_num_queues, etran_tcp->qid_napi_stats_fd,
+                        etran_tcp->qid_tw_stats_fd, etran_tcp->qid_tw_pending_fd,
+                        etran_tcp->_tcp_cc_map_mmap))
         goto err_2;
 
     /* launch threads */

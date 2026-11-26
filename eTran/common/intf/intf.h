@@ -122,7 +122,14 @@ enum LRPC_APPOUT_TCP_TYPE
     APPOUT_TCP_CLOSE,
     
     APPOUT_TCP_MAX,
+    APPOUT_TCP_WORKER_TID = 0x100,
 };
+
+struct appout_tcp_worker_tid_t {
+    uint32_t worker_idx;
+    int32_t os_tid;
+};
+static_assert(sizeof(appout_tcp_worker_tid_t) <= MAX_MSG_SIZE, "worker registration exceeds LRPC payload");
 
 // APPOUT_TCP_BIND
 struct appout_tcp_bind_t

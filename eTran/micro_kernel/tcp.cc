@@ -10,6 +10,7 @@
 #include <algorithm>
 
 #include "trans_ebpf.h"
+#include "scheduler.h"
 #include "nic.h"
 
 // mirco_kernel.cc
@@ -451,6 +452,7 @@ static void unreg_tcp_conn_ebpf(struct tcp_connection *c)
         fprintf(stderr, "unreg_tcp_conn_ebpf: failed to lookup ebpf map\n");
     }
 
+    scheduler_unregister_flow(c->cc_idx);
     free_cc_idx(ebpf_c.cc_idx);
 
     if (bpf_map_delete_elem(etran_tcp->_tcp_connection_map_fd, &key))
@@ -480,6 +482,7 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_tx_drops = 0;
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_acks = 0;
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ack_bytes = 0;
+    etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].txp = 0;
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].cnt_rx_ecn_bytes = 0;
     etran_tcp->_tcp_cc_map_mmap->entry[cc_idx].rtt_est = 0;
 
@@ -531,6 +534,8 @@ static int reg_tcp_conn_ebpf(struct tcp_connection *c, bool listen)
     }
 
     c->cc_idx = cc_idx;
+    if (!c->tctx->actx->use_shared_queues)
+        scheduler_register_flow(cc_idx, c->qid);
     memset(&c->cc_data, 0, sizeof(c->cc_data));
 #ifdef TIMELY
     c->algorithm = CC_TIMELY;

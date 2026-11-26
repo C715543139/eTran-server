@@ -2,6 +2,7 @@
 
 #include <signal.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include <base/ipc.h>
 #include <base/compiler.h>
@@ -45,7 +46,17 @@ static inline struct app_ctx_per_thread *alloc_tctx(void)
     std::lock_guard<std::mutex> lock(actx_lock);
     if (tctx_id >= actx->nr_app_threads)
         return NULL;
-    return &actx->tctx[tctx_id++];
+    const auto idx = tctx_id++;
+    auto *worker = &actx->tctx[idx];
+    if (actx->proto == IPPROTO_TCP) {
+        lrpc_msg message{};
+        message.cmd = APPOUT_TCP_WORKER_TID;
+        const appout_tcp_worker_tid_t identity{idx, static_cast<int32_t>(syscall(SYS_gettid))};
+        memcpy(message.data, &identity, sizeof(identity));
+        if (lrpc_send(&worker->app_out, &message))
+            fprintf(stderr, "Cannot report eTran worker TID for slot %u\n", idx);
+    }
+    return worker;
 }
 
 struct app_ctx_per_thread *eTran_get_tctx(void)

@@ -1791,6 +1791,17 @@ static void process_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
     switch (msg_in->cmd)
     {
     /***************** TCP *****************/
+    case APPOUT_TCP_WORKER_TID: {
+        appout_tcp_worker_tid_t identity;
+        memcpy(&identity, msg_in->data, sizeof(identity));
+        const auto *app = tctx->actx;
+        if (app->proto == IPPROTO_TCP && !app->use_shared_queues && app->nr_app_threads == 1 &&
+            identity.worker_idx == 0 && tctx == app->tctx && identity.os_tid > 0) {
+            for (unsigned int i = 0; i < app->nr_nic_queues; ++i)
+                scheduler_register_worker(app->nic_qid[i], app->pid, identity.os_tid);
+        }
+        break;
+    }
     case APPOUT_TCP_OPEN:
     case APPOUT_TCP_BIND:
     case APPOUT_TCP_LISTEN:

@@ -234,9 +234,11 @@ static inline size_t roundup_page(size_t sz)
 int eTranTCP::init_ebpf_maps(void)
 {
     auto *obj = xdp_program__bpf_obj(_ebpf.xdp_prog);
-    qid_stats_fd = bpf_object__find_map_fd_by_name(obj, "qid_stats_map");
-    if (qid_stats_fd < 0)
-        return qid_stats_fd;
+    qid_napi_stats_fd = bpf_object__find_map_fd_by_name(obj, ".bss.qid_napi_stats");
+    qid_tw_stats_fd = bpf_object__find_map_fd_by_name(obj, "tw_qid_stats_map");
+    qid_tw_pending_fd = bpf_object__find_map_fd_by_name(obj, ".bss.qid_tw_pending");
+    if (qid_napi_stats_fd < 0 || qid_tw_stats_fd < 0 || qid_tw_pending_fd < 0)
+        return -ENOENT;
 
     _tcp_connection_map_fd = bpf_map__fd(bpf_object__find_map_by_name(xdp_program__bpf_obj(_ebpf.xdp_prog), "bpf_tcp_conn_map"));
     if (_tcp_connection_map_fd < 0)

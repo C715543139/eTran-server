@@ -30,16 +30,20 @@
 
 #define MAX_TCP_FLOWS 65536
 
-struct bpf_qid_stats {
+struct bpf_qid_napi_stats {
     __u64 rx_xsk_pkts;
     __u64 rx_xsk_bytes;
     __u64 tx_direct_pkts;
     __u64 tx_direct_bytes;
     __u64 tw_enq_attempts;
+    __u64 pad[3];
+} __attribute__((aligned(64)));
+
+struct bpf_qid_tw_stats {
     __u64 tw_sent_pkts;
     __u64 tw_sent_bytes;
     __u64 tw_drop_pkts;
-} __attribute__((aligned(64)));
+};
 
 struct bpf_softirq_stats {
     __u64 net_rx_ns;
