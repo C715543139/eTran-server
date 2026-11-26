@@ -44,6 +44,7 @@ extern int thread_init(void);
 extern void wait_thread(void);
 extern void shutdown_thread(void);
 extern int request_worker_migration(int pid, unsigned int slot, int cpu);
+extern int request_irq_migration(unsigned int qid, int cpu);
 
 extern void dump_bpf_maps();
 extern void dump_ring_stats(void);

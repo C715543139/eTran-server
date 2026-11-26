@@ -217,11 +217,16 @@ static void run_monitor(void)
         {
             std::istringstream input(command);
             std::string action, entity, extra;
-            int pid, cpu;
-            unsigned int slot;
-            if (!(input >> action >> entity >> pid >> slot >> cpu) || entity != "worker" || (input >> extra))
-                fprintf(stderr, "Usage: migrate worker PID SLOT CPU\n");
-            else if (int rc = request_worker_migration(pid, slot, cpu))
+            int pid, cpu, rc = -EINVAL;
+            unsigned int slot, qid;
+            input >> action >> entity;
+            if (entity == "worker" && (input >> pid >> slot >> cpu) && !(input >> extra))
+                rc = request_worker_migration(pid, slot, cpu);
+            else if (entity == "irq" && (input >> qid >> cpu) && !(input >> extra))
+                rc = request_irq_migration(qid, cpu);
+            else
+                fprintf(stderr, "Usage: migrate worker PID SLOT CPU or migrate irq QID CPU\n");
+            if (rc)
                 fprintf(stderr, "Migration request failed: %s\n", strerror(-rc));
         }
         else

@@ -133,6 +133,17 @@ struct Registration {
 enum class Profile { Unknown, Idle, Light, Heavy };
 std::array<Profile, MAX_NIC_QUEUES> last_profiles{};
 
+struct IrqProgressSample {
+    uint64_t packets = 0;
+    Clock::time_point sampled_at{};
+    Clock::time_point last_traffic{};
+    bool no_backlog = false;
+};
+
+std::array<IrqProgressSample, MAX_NIC_QUEUES> last_irq_progress;
+std::array<__u32, MAX_CPU> last_pending{};
+bool pending_is_valid = false;
+
 const char *profile_name(Profile state)
 {
     switch (state) {
@@ -506,11 +517,29 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             report_shadow(snapshot, queue_state, worker_snapshot, pool);
         {
             std::lock_guard<std::mutex> lock(registration_mutex);
-            for (unsigned qid = 0; qid < queues; ++qid)
+            for (unsigned qid = 0; qid < queues; ++qid) {
                 if (snapshot[qid].generation == registrations[qid].generation &&
-                    snapshot[qid].pid && registrations[qid].pid)
-                    last_profiles[qid] = queue_state[qid].sampled && !queue_state[qid].drops && !progress[qid].stalled
-                                         ? queue_state[qid].profile : Profile::Unknown;
+                    snapshot[qid].pid && registrations[qid].pid) {
+                    const auto &state = queue_state[qid];
+                    last_profiles[qid] = state.sampled && !state.drops && !progress[qid].stalled
+                                         ? state.profile : Profile::Unknown;
+                    if (settings().manual) {
+                        auto &irq = last_irq_progress[qid];
+                        const auto packets = state.napi.rx_xsk_pkts + state.napi.tx_direct_pkts +
+                                             state.wheel.tw_sent_pkts;
+                        irq.no_backlog = state.sampled && !state.drops && !state.noisy &&
+                                         !progress[qid].inflight && !progress[qid].stalled;
+                        if (packets != irq.packets || !irq.no_backlog || !irq.sampled_at.time_since_epoch().count())
+                            irq.last_traffic = now;
+                        irq.packets = packets;
+                        irq.sampled_at = state.sampled ? now : Clock::time_point{};
+                    }
+                }
+            }
+            if (settings().manual) {
+                last_pending = pending;
+                pending_is_valid = have_pending;
+            }
         }
         if (have_probe)
             last_probe.swap(softirq);
@@ -533,6 +562,18 @@ bool scheduler_queue_is_light(unsigned int qid)
     return registrations[qid].pid && (last_profiles[qid] == Profile::Light || last_profiles[qid] == Profile::Idle);
 }
 
+SchedulerIrqProgress scheduler_irq_progress(unsigned int qid, int source, int target)
+{
+    const auto now = Clock::now();
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    const auto &sample = last_irq_progress[qid];
+    const bool fresh = registrations[qid].pid && now - sample.sampled_at <= 2 * sample_period;
+    const bool drained = fresh && sample.no_backlog && pending_is_valid &&
+                         last_pending[source] == 0 && last_pending[target] == 0;
+    return {fresh, drained && last_profiles[qid] == Profile::Idle,
+            drained && now - sample.last_traffic >= std::chrono::milliseconds(100)};
+}
+
 void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, int app_cpu)
 {
     if (!scheduler_collect_qid_stats())
@@ -541,6 +582,7 @@ void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, i
     auto &entry = registrations[qid];
     entry = {entry.generation + 1, pid, slo, irq_cpu, app_cpu};
     last_profiles[qid] = Profile::Unknown;
+    last_irq_progress[qid] = {};
 }
 
 void scheduler_unregister_queue(unsigned int qid)
@@ -582,6 +624,14 @@ void scheduler_update_app_cpu(unsigned int qid, int pid, int cpu)
     auto &entry = registrations[qid];
     if (entry.pid == pid)
         entry.app_cpu = cpu;
+}
+
+void scheduler_update_irq_cpu(unsigned int qid, int pid, int cpu)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    auto &entry = registrations[qid];
+    if (entry.pid == pid)
+        entry.irq_cpu = cpu;
 }
 
 void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo)

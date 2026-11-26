@@ -59,6 +59,7 @@
 #include "trans_ebpf.h"
 #include "nic.h"
 #include "scheduler.h"
+#include "irq_migration_io.h"
 
 #define TICK_US 1000
 #include <regex>      // std::regex、std::smatch、std::regex_search
@@ -101,6 +102,7 @@ static bool scheduler_admission = false;
 static bool scheduler_degrade = false;
 static bool scheduler_manual = false;
 static unsigned int quarantine_refs[MAX_CPU];
+static std::array<std::atomic<uint64_t>, MAX_NIC_QUEUES> irq_owner_tokens{};
 enum class CpuRole { Irq, App };
 static int cpuUsage[MAX_CPU]={0};//CPU利用率，80%在这里表示为80
 static std::array<std::atomic<int>, MAX_CPU> cpu_usage_sample{};
@@ -175,10 +177,26 @@ static void poll_lrpc(void);
 /* poll events from network */
 static int poll_network(int timeout_ms);
 
+struct IrqWork {
+    uint64_t token;
+    unsigned int qid;
+    int target;
+    int expected_source;
+    bool write;
+    bool read_counters;
+};
+
+struct IrqResult {
+    IrqWork operation;
+    IrqHandoffSample sample;
+    bool attempted = false;
+};
+
 struct RssJob {
     uint64_t generation;
     int remove_context;
     std::vector<std::pair<unsigned int, int>> placement;
+    std::optional<IrqWork> irq = std::nullopt;
 };
 
 struct RssResult {
@@ -186,6 +204,7 @@ struct RssResult {
     int remove_context;
     int context;
     int error;
+    std::optional<IrqResult> irq = std::nullopt;
 };
 
 static std::mutex rss_mutex;
@@ -736,8 +755,15 @@ struct WorkerMigrationRequest {
     uint64_t start_time;
 };
 
+struct IrqMigrationRequest {
+    unsigned int qid;
+    int cpu;
+    uint64_t generation;
+};
+
 static std::mutex migration_request_mutex;
 static std::optional<WorkerMigrationRequest> migration_request;
+static std::optional<IrqMigrationRequest> irq_migration_request;
 
 struct WorkerTaskState {
     uint64_t start_time = 0;
@@ -806,10 +832,25 @@ class MigrationExecutor {
         Clock::time_point published;
         bool wake_queued;
     };
+    struct IrqMove {
+        app_ctx *app;
+        unsigned int slot, qid;
+        int src, dst;
+        uint64_t token = 0;
+        State state = State::Migrating;
+        bool pending_io = false;
+        bool cancelled = false;
+        bool initially_idle = false;
+        IrqHandoffSample base{};
+        Clock::time_point began{}, next_sample{};
+    };
     std::optional<Move> action;
+    std::optional<IrqMove> irq_action;
     std::vector<Move> quarantined;
+    std::vector<IrqMove> irq_holds;
     Clock::time_point backoff_until{};
     uint32_t next_seq = 0;
+    uint64_t next_irq_token = 0;
 
     static int &worker_cpu(const Move &move)
     {
@@ -834,10 +875,67 @@ class MigrationExecutor {
                 move.app->pid, move.slot, move.seq, state == State::Migrating ? move.src : move.dst, cpu);
     }
 
+    static int &irq_cpu(const IrqMove &move)
+    {
+        auto it = move.app->usedCores.begin();
+        std::advance(it, move.slot);
+        return *it;
+    }
+
+    static void send_irq_io(IrqMove &move, bool write)
+    {
+        const bool rollback = move.state == State::RollingBack;
+        const int target = rollback ? move.src : move.dst;
+        const int expected = write && !rollback ? move.src : -1;
+        move.pending_io = true;
+        submit_rss_job({move.app->generation, 0, {},
+                        IrqWork{move.token, move.qid, target, expected, write, !move.initially_idle}});
+    }
+
+    void begin_irq(IrqMove &move, State state)
+    {
+        move.token = ++next_irq_token;
+        move.state = state;
+        move.began = Clock::now();
+        move.initially_idle = scheduler_irq_progress(move.qid, move.src, move.dst).idle;
+        fprintf(stderr, "sched_migration kind=IRQ state=%s app_gen=%llu qid=%u token=%llu src=%d dst=%d\n",
+                state == State::Migrating ? "MIGRATING" : "ROLLING_BACK",
+                static_cast<unsigned long long>(move.app->generation), move.qid,
+                static_cast<unsigned long long>(move.token), move.src, move.dst);
+        send_irq_io(move, true);
+    }
+
+    void hold_irq(IrqMove move, const char *state)
+    {
+        ++quarantine_refs[move.src];
+        ++quarantine_refs[move.dst];
+        irq_holds.push_back(move);
+        fprintf(stderr, "sched_migration kind=IRQ state=%s app_gen=%llu qid=%u token=%llu src=%d dst=%d\n",
+                state, static_cast<unsigned long long>(move.app->generation), move.qid,
+                static_cast<unsigned long long>(move.token), move.src, move.dst);
+        irq_action.reset();
+    }
+
+    void poll_irq()
+    {
+        if (!irq_action || irq_action->pending_io)
+            return;
+        auto &move = *irq_action;
+        const auto now = Clock::now();
+        if (now - move.began >= std::chrono::milliseconds(150)) {
+            if (move.state == State::Migrating)
+                begin_irq(move, State::RollingBack);
+            else
+                hold_irq(move, "QUARANTINED");
+        } else if (now >= move.next_sample) {
+            send_irq_io(move, false);
+        }
+    }
+
 public:
     int start(WorkerMigrationRequest request)
     {
-        if (action || Clock::now() < backoff_until)
+        if (action || irq_action || Clock::now() < backoff_until)
             return -EBUSY;
         const auto it = std::find_if(active_apps.apps.begin(), active_apps.apps.end(), [&](const auto *app) {
             return app->done && app->fd >= 0 && app->pid == request.pid &&
@@ -873,8 +971,106 @@ public:
         return 0;
     }
 
+    int start(IrqMigrationRequest request)
+    {
+        if (action || irq_action || Clock::now() < backoff_until)
+            return -EBUSY;
+        if (!valid_pool_cpu(request.cpu) || request.qid >= etran_nic->_num_queues)
+            return -EINVAL;
+        for (auto *app : active_apps.apps) {
+            if (app->generation != request.generation || !app->done || app->fd < 0 ||
+                app->proto != IPPROTO_TCP || app->use_shared_queues)
+                continue;
+            for (unsigned int slot = 0; slot < app->nr_nic_queues; ++slot) {
+                if (app->nic_qid[slot] != request.qid)
+                    continue;
+                IrqMove move{app, slot, request.qid, -1, request.cpu};
+                move.src = irq_cpu(move);
+                if (move.src == move.dst)
+                    return -EALREADY;
+                if (quarantine_refs[move.src] || quarantine_refs[move.dst])
+                    return -EBUSY;
+                const bool own_app = app->tcp_type != THROUGHPUT && app->nr_nic_queues == 1 &&
+                                     app->nr_app_threads == 1 && app->usedCores.back() == move.dst &&
+                                     cpuUseRef[move.dst] == 1 && scheduler_queue_is_light(move.qid);
+                if (cpuUseRef[move.dst] && !own_app)
+                    return -EBUSY;
+                if (int rc = reserve_cpu(app->tcp_type, CpuRole::Irq, move.dst); rc < 0)
+                    return rc;
+                irq_action = move;
+                begin_irq(*irq_action, State::Migrating);
+                return 0;
+            }
+        }
+        return -ENOENT;
+    }
+
+    void on_irq_result(const RssResult &result)
+    {
+        assert(result.irq);
+        const auto &io = *result.irq;
+        assert(irq_action && irq_action->token == io.operation.token &&
+               irq_action->app->generation == result.generation);
+        auto &move = *irq_action;
+        move.pending_io = false;
+        if (move.cancelled) {
+            hold_irq(move, "CANCELLED_QUIESCENT");
+            return;
+        }
+        const bool rollback = move.state == State::RollingBack;
+        move.next_sample = Clock::now() + std::chrono::milliseconds(5);
+        if (io.operation.write) {
+            move.base = io.sample;
+            if (!result.error)
+                return;
+            if (rollback) {
+                hold_irq(move, "QUARANTINED");
+            } else if (io.attempted) {
+                begin_irq(move, State::RollingBack);
+            } else if (io.sample.configured == move.src && io.sample.effective == move.src) {
+                release_cpu(*move.app, CpuRole::Irq, move.dst);
+                fprintf(stderr, "sched_migration kind=IRQ state=REJECTED qid=%u error=%d\n", move.qid, result.error);
+                irq_action.reset();
+            } else
+                hold_irq(move, "QUARANTINED");
+            return;
+        }
+        if (result.error)
+            return;
+        const auto &current = io.sample;
+        const int target = rollback ? move.src : move.dst;
+        if (current.timeouts != move.base.timeouts || current.done < move.base.done) {
+            if (rollback)
+                hold_irq(move, "QUARANTINED");
+            else
+                begin_irq(move, State::RollingBack);
+            return;
+        }
+        if (current.configured != target || current.effective != target)
+            return;
+        const auto elapsed = Clock::now() - move.began;
+        const auto progress = scheduler_irq_progress(move.qid, move.src, move.dst);
+        if (!(current.done > move.base.done || (move.initially_idle && progress.idle) ||
+              (elapsed >= std::chrono::milliseconds(100) && progress.quiet)))
+            return;
+
+        if (rollback) {
+            release_cpu(*move.app, CpuRole::Irq, move.dst);
+            backoff_until = Clock::now() + std::chrono::seconds(1);
+        } else {
+            irq_cpu(move) = move.dst;
+            scheduler_update_irq_cpu(move.qid, move.app->pid, move.dst);
+            release_cpu(*move.app, CpuRole::Irq, move.src);
+        }
+        fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld\n",
+                move.qid, target, rollback, static_cast<unsigned long long>(current.done - move.base.done),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+        irq_action.reset();
+    }
+
     void poll()
     {
+        poll_irq();
         if (!action)
             return;
         auto &move = *action;
@@ -930,6 +1126,11 @@ public:
 
     void cancel(const app_ctx &app)
     {
+        if (irq_action && irq_action->app == &app) {
+            irq_action->cancelled = true;
+            if (!irq_action->pending_io)
+                hold_irq(*irq_action, "CANCELLED_QUIESCENT");
+        }
         if (!action || action->app != &app)
             return;
         fprintf(stderr, "sched_migration state=CANCELLED pid=%d slot=%u seq=%u\n",
@@ -943,6 +1144,17 @@ public:
 
     void release(const app_ctx &app)
     {
+        assert(!irq_action || irq_action->app != &app);
+        for (const auto &move : irq_holds) {
+            if (move.app != &app)
+                continue;
+            --quarantine_refs[move.src];
+            --quarantine_refs[move.dst];
+            release_cpu(app, CpuRole::Irq, move.dst);
+        }
+        irq_holds.erase(std::remove_if(irq_holds.begin(), irq_holds.end(), [&](const auto &move) {
+            return move.app == &app;
+        }), irq_holds.end());
         for (const auto &move : quarantined) {
             if (move.app != &app)
                 continue;
@@ -961,10 +1173,16 @@ static MigrationExecutor migration_executor;
 static void poll_worker_migration()
 {
     std::optional<WorkerMigrationRequest> request;
+    std::optional<IrqMigrationRequest> irq;
     {
         std::lock_guard<std::mutex> lock(migration_request_mutex);
         request.swap(migration_request);
+        irq.swap(irq_migration_request);
     }
+    if (irq)
+        if (const int rc = migration_executor.start(*irq))
+            fprintf(stderr, "sched_migration kind=IRQ state=REJECTED qid=%u to=%d error=%d\n",
+                    irq->qid, irq->cpu, rc);
     if (request) {
         if (const int rc = migration_executor.start(*request))
             fprintf(stderr, "sched_migration state=REJECTED pid=%d slot=%u to=%d error=%d\n",
@@ -985,9 +1203,29 @@ int request_worker_migration(int pid, unsigned int slot, int cpu)
     if (!start_time)
         return -ENOENT;
     std::lock_guard<std::mutex> lock(migration_request_mutex);
-    if (migration_request)
+    if (migration_request || irq_migration_request)
         return -EBUSY;
     migration_request = WorkerMigrationRequest{pid, slot, cpu, start_time};
+    return 0;
+#else
+    return -EOPNOTSUPP;
+#endif
+}
+
+int request_irq_migration(unsigned int qid, int cpu)
+{
+#ifdef ALLOCATION
+    if (!scheduler_manual)
+        return -EOPNOTSUPP;
+    if (cpu < 0 || qid >= etran_nic->_num_queues)
+        return -EINVAL;
+    std::lock_guard<std::mutex> lock(migration_request_mutex);
+    if (migration_request || irq_migration_request)
+        return -EBUSY;
+    const auto generation = irq_owner_tokens[qid].load(std::memory_order_acquire);
+    if (!generation)
+        return -ENOENT;
+    irq_migration_request = IrqMigrationRequest{qid, cpu, generation};
     return 0;
 #else
     return -EOPNOTSUPP;
@@ -1051,6 +1289,22 @@ static int create_rss_context(struct app_ctx *actx, const std::vector<unsigned i
 static RssResult execute_rss_job(const RssJob &job)
 {
     RssResult result{job.generation, job.remove_context, 0, 0};
+    if (job.irq) {
+        const auto &op = *job.irq;
+        result.irq = IrqResult{op, {}};
+        auto &io = *result.irq;
+        result.error = sample_irq_handoff(*etran_nic, op.qid, op.read_counters, io.sample);
+        if (result.error || !op.write)
+            return result;
+        if (op.expected_source >= 0 &&
+            (io.sample.configured != op.expected_source || io.sample.effective != op.expected_source)) {
+            result.error = -ESTALE;
+            return result;
+        }
+        io.attempted = true;
+        result.error = etran_nic->set_queue_cpu(op.qid, op.target);
+        return result;
+    }
     if (job.remove_context) {
         result.error = delete_tcp_rss_context(job.remove_context) ? 0 : -EIO;
         return result;
@@ -1206,8 +1460,12 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
 #endif
         scheduler_unregister_workers(actx->generation);
         if (actx->done && !actx->use_shared_queues) {
-            for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
+            for (unsigned int i = 0; i < actx->nr_nic_queues; ++i) {
+#ifdef ALLOCATION
+                irq_owner_tokens[actx->nic_qid[i]].store(0, std::memory_order_release);
+#endif
                 scheduler_unregister_queue(actx->nic_qid[i]);
+            }
         }
         free_tcp_resources(actx);
     }
@@ -1277,8 +1535,18 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
 
 static void destroy_all_apps(void)
 {
+#ifdef ALLOCATION
+    for (auto *app : active_apps.apps)
+        migration_executor.cancel(*app);
+#endif
     stop_rss_worker();
     for (const auto &result : take_rss_results()) {
+#ifdef ALLOCATION
+        if (result.irq) {
+            migration_executor.on_irq_result(result);
+            continue;
+        }
+#endif
         for (auto *app : active_apps.apps) {
             if (app->generation != result.generation)
                 continue;
@@ -1400,6 +1668,9 @@ static void finish_registration(app_ctx &app)
         for (unsigned int i = 0; i < app.nr_nic_queues; ++i, ++irq_cpu)
             scheduler_register_queue(app.nic_qid[i], app.pid, app.tcp_type, *irq_cpu, app_cpu);
     }
+    if (scheduler_manual && app.proto == IPPROTO_TCP && !app.use_shared_queues)
+        for (unsigned int i = 0; i < app.nr_nic_queues; ++i)
+            irq_owner_tokens[app.nic_qid[i]].store(app.generation, std::memory_order_release);
 #endif
     app.done = true;
 }
@@ -1984,6 +2255,12 @@ static int update_uds_interest(const app_ctx &app, bool was_writing)
 static void poll_rss_results()
 {
     for (const auto &result : take_rss_results()) {
+#ifdef ALLOCATION
+        if (result.irq) {
+            migration_executor.on_irq_result(result);
+            continue;
+        }
+#endif
         auto &apps = active_apps.apps;
         auto it = std::find_if(apps.begin(), apps.end(), [&](const auto *app) {
             return app->generation == result.generation;
