@@ -18,6 +18,14 @@
 #include <string>
 #include <mutex>
 #include <algorithm>
+#include <atomic>
+#include <array>
+#include <chrono>
+#include <condition_variable>
+#include <climits>
+#include <deque>
+#include <thread>
+#include <utility>
 
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -71,6 +79,8 @@ static std::list<uint16_t> available_ports;
 /* track status of port */
 static std::unordered_map<uint16_t, bool> port_is_available;
 static pthread_t micro_kernel_thread;
+static std::atomic<bool> control_stopping{false};
+static_assert(std::atomic<bool>::is_always_lock_free);
 
 static std::unordered_map<uint16_t, app_ctx *> sport_to_actx,
                                                dport_to_actx;
@@ -88,6 +98,7 @@ static int cpuIrqRefs[MAX_CPU];
 static int cpuThroughputAppRefs[MAX_CPU];
 enum class CpuRole { Irq, App };
 static int cpuUsage[MAX_CPU]={0};//CPU利用率，80%在这里表示为80
+static std::array<std::atomic<int>, MAX_CPU> cpu_usage_sample{};
 //默认前一半的CPU用于throughput，之后2个给latency，之后全部放入available中
 
 struct cpuOverheadInfo {
@@ -133,12 +144,12 @@ static int register_slow_path_map(unsigned int qid, int xsk_map_key, int proto);
 static void unregister_slow_path_map(unsigned int qid, int proto);
 
 /* manage RSS context for this application */
-static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads);
+static int create_rss_context(struct app_ctx *actx, const std::vector<unsigned int> &qids);
 static void destroy_rss_context(struct app_ctx *actx);
 
 /* manage application resources */
 static int alloc_app_resources(struct register_request &req, int fd, int requested_app_cpu);
-static void free_app_resources(struct app_ctx *actx);
+static void free_app_resources(struct app_ctx *actx, bool return_queues = true);
 
 /* called when microkernel exits */
 static void destroy_all_apps(void);
@@ -158,6 +169,54 @@ static int poll_uds(int timeout_ms);
 static void poll_lrpc(void);
 /* poll events from network */
 static int poll_network(int timeout_ms);
+
+struct RssJob {
+    uint64_t generation;
+    int remove_context;
+    std::vector<std::pair<unsigned int, int>> placement;
+};
+
+struct RssResult {
+    uint64_t generation;
+    int remove_context;
+    int context;
+    int error;
+};
+
+static std::mutex rss_mutex;
+static std::condition_variable rss_notify;
+static std::deque<RssJob> rss_jobs;
+static std::vector<RssResult> rss_results;
+static std::thread rss_thread;
+static bool rss_stopping;
+
+static void submit_rss_job(RssJob job)
+{
+    {
+        std::lock_guard<std::mutex> lock(rss_mutex);
+        rss_jobs.push_back(std::move(job));
+    }
+    rss_notify.notify_one();
+}
+
+static std::vector<RssResult> take_rss_results()
+{
+    std::vector<RssResult> ready;
+    std::lock_guard<std::mutex> lock(rss_mutex);
+    ready.swap(rss_results);
+    return ready;
+}
+
+static void stop_rss_worker()
+{
+    {
+        std::lock_guard<std::mutex> lock(rss_mutex);
+        rss_stopping = true;
+    }
+    rss_notify.notify_one();
+    if (rss_thread.joinable())
+        rss_thread.join();
+}
 
 /* dump ebpf maps */
 static void dump_xsk_map(int proto);
@@ -329,15 +388,19 @@ int unrecord_port(struct app_ctx *actx, uint16_t port)
     return 0;
 }
 
+static bool delete_tcp_rss_context(int id)
+{
+    std::string output;
+    if (!exec_cmd("ethtool -X " + etran_nic->_if_name + " delete context " + std::to_string(id), output, true))
+        return false;
+    printf("Destroy RSS context success: %d\n", id);
+    return true;
+}
+
 static void destroy_rss_context(struct app_ctx *actx)
 {
-    if (actx->rss_ctx_id == 0 || actx->proto != IPPROTO_TCP)
-        return;
-    std::string cmd;
-    cmd = "ethtool -X " + etran_nic->_if_name + " delete context " + std::to_string(actx->rss_ctx_id);
-    if (exec_cmd(cmd))
-        printf("Destroy RSS context success: %d\n", actx->rss_ctx_id);
-    actx->rss_ctx_id = 0;
+    if (actx->rss_ctx_id && actx->proto == IPPROTO_TCP && delete_tcp_rss_context(actx->rss_ctx_id))
+        actx->rss_ctx_id = 0;
 }
 
 #ifdef ALLOCATION
@@ -376,19 +439,14 @@ static inline unsigned long long sum_idle(const cpuOverheadInfo &x) {
     return (unsigned long long)x.idle + x.iowait; // 计算 idleAll
 }
 
-// 间隔 100ms 读取两次并计算每核使用率（百分数）
-static void get_cpu_overhead_info(void) {
-    std::map<int, cpuOverheadInfo> a, b;
-    std::fill_n(cpuUsage, MAX_CPU, 0);
-    if (!read_cpu_times(a))
-        return;
-    usleep(100000);
-    if (!read_cpu_times(b))
+static void sample_legacy_cpu_load(std::map<int, cpuOverheadInfo> &previous) {
+    std::map<int, cpuOverheadInfo> current;
+    if (!read_cpu_times(current))
         return;
 
-    for (const auto &[cpu, before] : a) {
-        auto it = b.find(cpu);
-        if (it == b.end())
+    for (const auto &[cpu, before] : previous) {
+        auto it = current.find(cpu);
+        if (it == current.end())
             continue;
         const auto &after = it->second;
         unsigned long long ta = sum_all(before);
@@ -399,9 +457,10 @@ static void get_cpu_overhead_info(void) {
         unsigned long long dt = (tb > ta) ? (tb - ta) : 0ULL;
         unsigned long long di = (ib > ia) ? (ib - ia) : 0ULL;
 
-        if (dt > di)
-            cpuUsage[cpu] = ((dt - di) * 100 + dt / 2) / dt;
+        const int usage = dt > di ? ((dt - di) * 100 + dt / 2) / dt : 0;
+        cpu_usage_sample[cpu].store(usage, std::memory_order_relaxed);
     }
+    previous.swap(current);
 }
 
 int get_least_loaded_cpu(const std::set<int> *candidate, int *cpuId, int *cpuOverhead) {
@@ -537,7 +596,7 @@ static int allocate_cpu(const app_ctx *actx, CpuRole role, int requested_cpu)
     return cpu < 0 ? cpu : reserve_cpu(actx->tcp_type, role, cpu);
 }
 
-static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads) {
+static int bind_rss_core(struct app_ctx *actx, const std::vector<unsigned int> &qids, bool deferred) {
     int irq_cpu = -1;
     const char *fixed_cpu = std::getenv(actx->tcp_type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
     if (fixed_cpu) {
@@ -549,18 +608,20 @@ static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::
         irq_cpu = cpu;
     }
     if (irq_cpu < 0 || actx->requested_app_cpu < 0)
-        get_cpu_overhead_info();
-    for (unsigned int i = 0; i < nr_nic_queues; i++) {
+        for (int cpu : etran_nic->_cpu_topology.pool)
+            cpuUsage[cpu] = cpu_usage_sample[cpu].load(std::memory_order_relaxed);
+    for (unsigned int qid : qids) {
         int cpu = allocate_cpu(actx, CpuRole::Irq, irq_cpu);
         if (cpu < 0)
             return cpu;
         actx->usedCores.push_back(cpu);
-        if (int err = etran_nic->set_queue_cpu(qids[i], cpu))
-            return err;
+        if (!deferred)
+            if (int err = etran_nic->set_queue_cpu(qid, cpu))
+                return err;
         printf("CPU allocation pid=%d role=IRQ queue=%u cpu=%d refs=%d latency_refs=%d\n",
-               actx->pid, qids[i], cpu, cpuUseRef[cpu], cpuLatUseRef[cpu]);
+               actx->pid, qid, cpu, cpuUseRef[cpu], cpuLatUseRef[cpu]);
     }
-    for (unsigned int i = 0; i < nr_app_threads; i++) {
+    for (unsigned int i = 0; i < actx->nr_app_threads; i++) {
         int cpu = allocate_cpu(actx, CpuRole::App, actx->requested_app_cpu);
         if (cpu < 0)
             return cpu;
@@ -572,30 +633,13 @@ static int bind_rss_core(struct app_ctx *actx, unsigned int nr_nic_queues, std::
 }
 #endif
 
-static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, std::vector<unsigned int> &qids, unsigned int nr_app_threads)
+static int create_tcp_rss_context(const std::vector<unsigned int> &qids)
 {
-    std::string cmd;
-    std::string res;
     std::vector<int> weight(etran_nic->_num_queues);
-
-    // XXX: Homa doesn't support RSS, we can only support one Homa application with queue-level isolation
-    if (actx->proto != IPPROTO_TCP)
-    {
-        // Homa ingress requires the hardware queue and the CPU to match.
-        for (unsigned int qid : qids) {
-            if (int err = etran_nic->set_queue_cpu(qid, qid))
-                return err;
-        }
-        cmd = "ethtool -X " + etran_nic->_if_name + " equal " + std::to_string(nr_nic_queues);
-        return !exec_cmd(cmd);
-    }
-
-    for (unsigned int i = 0; i < nr_nic_queues; i++)
-    {
-        unsigned int qidx = qids[i];
-        if (qidx >= weight.size())
+    for (unsigned int qid : qids) {
+        if (qid >= weight.size())
             return -EINVAL;
-        weight[qidx] = 1;
+        weight[qid] = 1;
     }
     // convert weight to string like '1 1 1 0 1 0 0'
     std::string weight_str;
@@ -605,30 +649,94 @@ static int create_rss_context(struct app_ctx *actx, unsigned int nr_nic_queues, 
         if (i + 1 != weight.size())
             weight_str += " ";
     }
-    cmd = "ethtool -X " + etran_nic->_if_name + " context new weight " + weight_str;
-    std::cout << cmd << std::endl;
-    exec_cmd(cmd, res);
-    if (res.empty())
-    {
+    std::string res;
+    if (!exec_cmd("ethtool -X " + etran_nic->_if_name + " context new weight " + weight_str, res, true)) {
         fprintf(stderr, "Failed to configure NIC flow director\n");
-        return -1;
+        return -EIO;
     }
-    size_t pos = res.find("New RSS context is ");
-    if (pos != std::string::npos)
-    {
-        actx->rss_ctx_id = std::stoi(res.substr(pos + 19));
-        printf("Created RSS context: %d\n", actx->rss_ctx_id);
+    constexpr char prefix[] = "New RSS context is ";
+    const size_t pos = res.find(prefix);
+    if (pos == std::string::npos)
+        return -EIO;
+    const char *start = res.c_str() + pos + sizeof(prefix) - 1;
+    char *end = nullptr;
+    const long id = strtol(start, &end, 10);
+    if (end == start || id <= 0 || id > INT_MAX)
+        return -EIO;
+    printf("Created RSS context: %ld\n", id);
+    return static_cast<int>(id);
+}
+
+static int create_rss_context(struct app_ctx *actx, const std::vector<unsigned int> &qids)
+{
+    if (actx->proto != IPPROTO_TCP) {
+        // Homa ingress requires the hardware queue and the CPU to match.
+        for (unsigned int qid : qids)
+            if (int err = etran_nic->set_queue_cpu(qid, qid))
+                return err;
+        return exec_cmd("ethtool -X " + etran_nic->_if_name + " equal " + std::to_string(qids.size())) ? 0 : -EIO;
     }
-    else
-    {
-        fprintf(stderr, "The required pattern was not found.\n");
-        return -1;
-    }
+    const int id = create_tcp_rss_context(qids);
+    if (id < 0)
+        return id;
+    actx->rss_ctx_id = id;
 #if defined(ALLOCATION)
-    if (actx->proto == IPPROTO_TCP)
-        return bind_rss_core(actx, nr_nic_queues, qids, nr_app_threads);
-#endif
+    return bind_rss_core(actx, qids, false);
+#else
     return 0;
+#endif
+}
+
+static RssResult execute_rss_job(const RssJob &job)
+{
+    RssResult result{job.generation, job.remove_context, 0, 0};
+    if (job.remove_context) {
+        result.error = delete_tcp_rss_context(job.remove_context) ? 0 : -EIO;
+        return result;
+    }
+
+    std::vector<unsigned int> qids;
+    for (const auto &[qid, cpu] : job.placement) {
+        if (cpu >= 0 && (result.error = etran_nic->set_queue_cpu(qid, cpu)))
+            return result;
+        qids.push_back(qid);
+    }
+    const int id = create_tcp_rss_context(qids);
+    if (id < 0)
+        result.error = id;
+    else
+        result.context = id;
+    return result;
+}
+
+static void run_rss_worker()
+{
+#ifdef ALLOCATION
+    std::map<int, cpuOverheadInfo> previous;
+    using Clock = std::chrono::steady_clock;
+    auto sample_at = Clock::now();
+#endif
+    for (;;) {
+        std::unique_lock<std::mutex> lock(rss_mutex);
+#ifdef ALLOCATION
+        if (!rss_notify.wait_until(lock, sample_at, [] { return rss_stopping || !rss_jobs.empty(); })) {
+            lock.unlock();
+            sample_legacy_cpu_load(previous);
+            sample_at = Clock::now() + std::chrono::milliseconds(100);
+            continue;
+        }
+#else
+        rss_notify.wait(lock, [] { return rss_stopping || !rss_jobs.empty(); });
+#endif
+        if (rss_jobs.empty())
+            return;
+        auto job = std::move(rss_jobs.front());
+        rss_jobs.pop_front();
+        lock.unlock();
+        const auto result = execute_rss_job(job);
+        lock.lock();
+        rss_results.push_back(result);
+    }
 }
 
 static void unregister_xsk_map(int xsk_fd, int xsk_map_key, int proto)
@@ -693,27 +801,36 @@ static int register_xsk_map(int xsk_fd, int xsk_map_key, int proto)
     return 0;
 }
 
-static void free_app_resources(struct app_ctx *actx)
+static void return_resources(app_ctx &app)
+{
+#ifdef ALLOCATION
+    if (app.proto == IPPROTO_TCP)
+        release_app_cpus(&app);
+#endif
+    if (!app.use_shared_queues)
+        for (unsigned int i = 0; i < app.nr_nic_queues; ++i)
+            etran_nic->_free_exclusive_qids.push_back(app.nic_qid[i]);
+}
+
+static void free_app_resources(struct app_ctx *actx, bool return_queues)
 {
     if (actx->proto == IPPROTO_TCP)
     {
         scheduler_unregister_workers(actx->generation);
-        if (!actx->use_shared_queues) {
+        if (actx->done && !actx->use_shared_queues) {
             for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
                 scheduler_unregister_queue(actx->nic_qid[i]);
         }
         free_tcp_resources(actx);
-#ifdef ALLOCATION
-        release_app_cpus(actx);
-#endif
     }
 
-    if (actx->proto == IPPROTO_HOMA)
+    if (actx->done && actx->proto == IPPROTO_HOMA)
     {
         free_homa_resources(actx);
     }
 
-    destroy_rss_context(actx);
+    if (return_queues)
+        destroy_rss_context(actx);
 
     for (unsigned int i = 0; i < actx->nr_nic_queues; i++)
     {
@@ -761,67 +878,83 @@ static void free_app_resources(struct app_ctx *actx)
         shm_wrapper_destroy(actx->tctx[i].lrpc);
         close(actx->tctx[i].evfd);
     }
-    for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
-        etran_nic->_free_exclusive_qids.push_back(actx->nic_qid[i]);
+    if (return_queues)
+        return_resources(*actx);
+    actx->done = false;
+    actx->resources_ready = false;
 }
 
 static void destroy_all_apps(void)
 {
+    stop_rss_worker();
+    for (const auto &result : take_rss_results()) {
+        for (auto *app : active_apps.apps) {
+            if (app->generation != result.generation)
+                continue;
+            if (!result.remove_context)
+                app->rss_ctx_id = result.context;
+            else if (!result.error)
+                app->rss_ctx_id = 0;
+            break;
+        }
+    }
     if (active_apps.apps.empty()) {
         return;
     }
     // Notify all apps to exit
-    for (auto it = active_apps.apps.begin(); it != active_apps.apps.end(); it++)
-    {
-        kill_app((*it)->pid);
-    }
-
-    // Wait for all apps to exit
-    while (1)
-    {
-        static int max_wait_time = 1;
-        sleep(1);
-        if (--max_wait_time == 0)
-        {
-            fprintf(stderr, "Wait for app exit timeout\n");
-            break;
+    bool had_live_apps = false;
+    for (auto *app : active_apps.apps) {
+        if (app->fd >= 0 && app->done) {
+            kill_app(app->pid);
+            had_live_apps = true;
         }
     }
+    if (had_live_apps)
+        sleep(1);
 
     // Free all resources
-    for (auto it = active_apps.apps.begin(); it != active_apps.apps.end(); it++)
-    {
-        if ((*it)->done)
-            free_app_resources(*it);
-        close((*it)->fd);
-        delete (*it);
+    for (auto *app : active_apps.apps) {
+        if (app->resources_ready || app->done)
+            free_app_resources(app);
+        else
+            destroy_rss_context(app);
+        if (app->fd >= 0)
+            close(app->fd);
+        delete app;
     }
     active_apps.apps.clear();
+    active_apps.nr_app = 0;
+}
+
+static void erase_app(app_ctx *app)
+{
+    auto &apps = active_apps.apps;
+    apps.erase(std::find(apps.begin(), apps.end(), app));
+    --active_apps.nr_app;
+    delete app;
+}
+
+static void retire_app(app_ctx *app)
+{
+    if (app->rss_ctx_id && !app->use_shared_queues) {
+        free_app_resources(app, false);
+        submit_rss_job({app->generation, app->rss_ctx_id, {}});
+        return;
+    }
+    if (app->resources_ready || app->done)
+        free_app_resources(app);
+    erase_app(app);
 }
 
 static void destroy_app(int fd)
 {
-    if (active_apps.nr_app == 0)
-        return;
-    auto it = active_apps.apps.begin();
-    for (; it != active_apps.apps.end(); it++)
-    {
-        if ((*it)->fd == fd)
-        {
-            if ((*it)->done) {
-                free_app_resources(*it);
-                kill_app((*it)->pid);
-            }
-            close(fd);
-            active_apps.nr_app--;
-            printf("Destroy app_fd: %d\n", fd);
-            break;
-        }
-    }
-    if (it != active_apps.apps.end())
-    {
-        delete (*it);
-        active_apps.apps.erase(it);
+    if (auto *app = find_actx_with_fd(fd)) {
+        close(fd);
+        app->fd = -1;
+        if (app->done)
+            kill_app(app->pid);
+        if (app->uds_state != UdsState::WaitMgmt)
+            retire_app(app);
     }
 }
 
@@ -864,6 +997,19 @@ static void prepare_uds_response(app_ctx &app, UdsState state, resp_type type, i
         };
         #endif
     }
+}
+
+static void finish_registration(app_ctx &app)
+{
+#ifdef ALLOCATION
+    if (scheduler_collect_qid_stats() && app.proto == IPPROTO_TCP && !app.use_shared_queues) {
+        auto irq_cpu = app.usedCores.begin();
+        const int app_cpu = app.nr_app_threads == 1 ? app.usedCores.back() : -1;
+        for (unsigned int i = 0; i < app.nr_nic_queues; ++i, ++irq_cpu)
+            scheduler_register_queue(app.nic_qid[i], app.pid, app.tcp_type, *irq_cpu, app_cpu);
+    }
+#endif
+    app.done = true;
 }
 
 static void unregister_slow_path_map(unsigned int qid, int proto)
@@ -1236,21 +1382,31 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (thread_bcache_create(&actx->bpw, &actx->iobuffer))
         goto err;
 
-    if (int error = create_rss_context(actx, req.nr_nic_queues, qids, req.nr_app_threads)) {
+    actx->resources_ready = true;
+    if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
+        RssJob job{actx->generation, 0, {}};
+#ifdef ALLOCATION
+        if (int error = bind_rss_core(actx, qids, true)) {
+            free_app_resources(actx);
+            return error;
+        }
+        auto cpu = actx->usedCores.begin();
+        for (auto qid : qids)
+            job.placement.emplace_back(qid, *cpu++);
+#else
+        for (auto qid : qids)
+            job.placement.emplace_back(qid, -1);
+#endif
+        actx->uds_state = UdsState::WaitMgmt;
+        submit_rss_job(std::move(job));
+        return -EINPROGRESS;
+    }
+    if (int error = create_rss_context(actx, qids)) {
         free_app_resources(actx);
         return error;
     }
 
-    #ifdef ALLOCATION
-    if (scheduler_collect_qid_stats() && actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
-        auto irq_cpu = actx->usedCores.begin();
-        const int app_cpu = req.nr_app_threads == 1 ? actx->usedCores.back() : -1;
-        for (unsigned int i = 0; i < req.nr_nic_queues; ++i, ++irq_cpu)
-            scheduler_register_queue(qids[i], actx->pid, actx->tcp_type, *irq_cpu, app_cpu);
-    }
-    #endif
-    actx->done = true;
-
+    finish_registration(*actx);
     return 0;
 
 err:
@@ -1350,11 +1506,14 @@ static int poll_uds_reply(app_ctx &app)
 
 static bool uds_wants_write(UdsState state)
 {
-    return state != UdsState::RecvRequest && state != UdsState::RecvCpu && state != UdsState::Ready;
+    return state != UdsState::RecvRequest && state != UdsState::RecvCpu &&
+           state != UdsState::Ready && state != UdsState::WaitMgmt;
 }
 
 static int poll_uds_request(app_ctx &app)
 {
+    if (app.uds_state == UdsState::WaitMgmt)
+        return -EPROTO;
     if (app.uds_state == UdsState::RecvCpu) {
         int rc = poll_uds_frame(app, &app.uds_requested_cpu, sizeof(app.uds_requested_cpu), false);
         if (rc <= 0)
@@ -1375,6 +1534,8 @@ static int poll_uds_request(app_ctx &app)
             return -EPROTO;
     }
     const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_requested_cpu);
+    if (error == -EINPROGRESS)
+        return 1;
     if (error)
         prepare_uds_response(app, UdsState::SendError, REG_FAIL, error);
     else
@@ -1393,6 +1554,43 @@ static int update_uds_interest(const app_ctx &app, bool was_writing)
     if (epoll_ctl(epfd, EPOLL_CTL_MOD, app.fd, &ev) < 0)
         return -errno;
     return 0;
+}
+
+static void poll_rss_results()
+{
+    for (const auto &result : take_rss_results()) {
+        auto &apps = active_apps.apps;
+        auto it = std::find_if(apps.begin(), apps.end(), [&](const auto *app) {
+            return app->generation == result.generation;
+        });
+        assert(it != apps.end());
+        auto *app = *it;
+        if (result.remove_context) {
+            if (result.error) {
+                fprintf(stderr, "RSS cleanup failed app_gen=%llu rss_context=%d, holding CPU and QID reservations\n",
+                        static_cast<unsigned long long>(app->generation), result.remove_context);
+                continue;
+            }
+            app->rss_ctx_id = 0;
+            return_resources(*app);
+            erase_app(app);
+            continue;
+        }
+        app->rss_ctx_id = result.context;
+        if (app->fd < 0) {
+            retire_app(app);
+            continue;
+        }
+        if (result.error) {
+            free_app_resources(app);
+            prepare_uds_response(*app, UdsState::SendError, REG_FAIL, result.error);
+        } else {
+            finish_registration(*app);
+            prepare_uds_response(*app, UdsState::SendXsk, REG_XSK_FD);
+        }
+        if (update_uds_interest(*app, false))
+            destroy_app(app->fd);
+    }
 }
 
 static int accept_app(void)
@@ -1509,12 +1707,52 @@ static int poll_uds(int timeout_ms)
     return 0;
 }
 
+struct CcJitter {
+    // One microsecond per bucket, with a saturated overflow bucket.
+    std::array<uint64_t, 2001> bins{};
+    uint64_t previous = 0, samples = 0, maximum = 0, slow300 = 0, slow500 = 0;
+
+    void observe(uint64_t now)
+    {
+        if (previous) {
+            const auto interval = static_cast<uint64_t>(cycles_to_us(now - previous));
+            ++bins[std::min<uint64_t>(interval, bins.size() - 1)];
+            ++samples;
+            maximum = std::max(maximum, interval);
+            slow300 += interval > 300;
+            slow500 += interval > 500;
+        }
+        previous = now;
+    }
+
+    size_t quantile(unsigned percentile) const
+    {
+        const auto rank = (samples * percentile + 99) / 100;
+        uint64_t seen = 0;
+        for (size_t i = 0; i < bins.size(); ++i) {
+            seen += bins[i];
+            if (seen >= rank)
+                return i;
+        }
+        return bins.size() - 1;
+    }
+
+    void report() const
+    {
+        fprintf(stderr, "cc_jitter samples=%llu p50_bucket_us=%zu p99_bucket_us=%zu max_us=%llu gt300=%llu gt500=%llu\n",
+                static_cast<unsigned long long>(samples), quantile(50), quantile(99),
+                static_cast<unsigned long long>(maximum), static_cast<unsigned long long>(slow300),
+                static_cast<unsigned long long>(slow500));
+    }
+};
+
 static void *control_loop(void *arg)
 {
     struct epoll_event ev;
     uint64_t tcp_s, tcp_e, homa_next_tsc = 0;
-
-    pthread_cleanup_push((void (*)(void *))destroy_all_apps, nullptr);
+    const char *cc_jitter_flag = std::getenv("ETRAN_CC_JITTER");
+    const bool track_cc_jitter = cc_jitter_flag && strcmp(cc_jitter_flag, "1") == 0;
+    CcJitter cc_jitter;
 
     epfd = epoll_create1(0);
     if (epfd < 0)
@@ -1532,10 +1770,11 @@ static void *control_loop(void *arg)
     }
     homa_next_tsc = get_cycles() + us_to_cycles(1000);
     
-    for (;;)
+    while (!control_stopping.load(std::memory_order_relaxed))
     {
         /* poll unix domain socket */
         poll_uds(enrollment_to_ms);
+        poll_rss_results();
 
         /* poll lrpc channels */
         poll_lrpc();
@@ -1548,6 +1787,8 @@ static void *control_loop(void *arg)
 
         /* poll tcp congestion control and timeout events */
         tcp_s = get_cycles();
+        if (track_cc_jitter)
+            cc_jitter.observe(tcp_s);
         poll_tcp_cc_to();
         tcp_e = get_cycles();
 
@@ -1571,8 +1812,10 @@ static void *control_loop(void *arg)
         }
     }
 
-    pthread_cleanup_pop(1);
-
+    if (track_cc_jitter)
+        cc_jitter.report();
+    destroy_all_apps();
+    close(epfd);
     return nullptr;
 }
 
@@ -1599,6 +1842,34 @@ int thread_init(void)
         return -1;
     }
 
+    int mgmt_cpu = topology.control;
+    if (const char *value = std::getenv("ETRAN_SCHED_CPU")) {
+        char *end;
+        const auto parsed = strtol(value, &end, 10);
+        if (end == value || *end || parsed < 0 || parsed >= CPU_SETSIZE ||
+            !std::binary_search(topology.online.begin(), topology.online.end(), parsed) ||
+            std::binary_search(topology.pool.begin(), topology.pool.end(), parsed) || parsed == topology.control) {
+            fprintf(stderr, "Invalid ETRAN_SCHED_CPU for RSS management\n");
+            destroy_uds_ctx(uds_sockfd);
+            return -EINVAL;
+        }
+        mgmt_cpu = static_cast<int>(parsed);
+    }
+    try {
+        rss_thread = std::thread(run_rss_worker);
+    } catch (const std::system_error &error) {
+        destroy_uds_ctx(uds_sockfd);
+        return -error.code().value();
+    }
+    cpu_set_t mgmt_set;
+    CPU_ZERO(&mgmt_set);
+    CPU_SET(mgmt_cpu, &mgmt_set);
+    if (int error = pthread_setaffinity_np(rss_thread.native_handle(), sizeof(mgmt_set), &mgmt_set)) {
+        stop_rss_worker();
+        destroy_uds_ctx(uds_sockfd);
+        return -error;
+    }
+
     cpu_set_t requested;
     CPU_ZERO(&requested);
     CPU_SET(topology.control, &requested);
@@ -1614,6 +1885,7 @@ int thread_init(void)
     if (err != 0) {
         fprintf(stderr, "Cannot start control plane on CPU %d: %s\n",
                 topology.control, strerror(err));
+        stop_rss_worker();
         destroy_uds_ctx(uds_sockfd);
         return -1;
     }
@@ -1622,7 +1894,7 @@ int thread_init(void)
     err = pthread_getaffinity_np(micro_kernel_thread, sizeof(actual), &actual);
     if (err != 0 || !CPU_EQUAL(&requested, &actual)) {
         fprintf(stderr, "Cannot verify control-plane affinity on CPU %d\n", topology.control);
-        pthread_cancel(micro_kernel_thread);
+        control_stopping.store(true, std::memory_order_relaxed);
         pthread_join(micro_kernel_thread, nullptr);
         destroy_uds_ctx(uds_sockfd);
         return -1;
@@ -1640,7 +1912,7 @@ void wait_thread(void)
 
 void shutdown_thread(void)
 {
-    pthread_cancel(micro_kernel_thread);
+    control_stopping.store(true, std::memory_order_relaxed);
 }
 
 static void dump_homa_rpc_map(void)

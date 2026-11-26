@@ -48,7 +48,7 @@ struct fd_rule_t {
 };
 
 enum class UdsState {
-    RecvRequest, SendCpuReady, RecvCpu, SendXsk, SendEvent, SendDone, SendError, Ready
+    RecvRequest, SendCpuReady, RecvCpu, WaitMgmt, SendXsk, SendEvent, SendDone, SendError, Ready
 };
 
 // application context in kernel
@@ -75,6 +75,7 @@ struct app_ctx
 
     // if we have allocated resources for this application
     bool done;
+    bool resources_ready = false;
 
     // used in process_packet()
     bool need_refill = false;
