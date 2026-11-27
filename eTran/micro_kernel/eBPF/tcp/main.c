@@ -379,7 +379,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         ret = bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
         if (qid_stats_enabled && ret == XDP_REDIRECT) {
-            __u32 stats_qid = qid & (MAX_NIC_QUEUES - 1);
+            // Keep the mask in BPF instructions even when Clang proves the earlier bound.
+            __u32 stats_qid = qid;
+            barrier_var(stats_qid);
+            stats_qid &= MAX_NIC_QUEUES - 1;
             ++qid_napi_stats[stats_qid].rx_xsk_pkts;
             qid_napi_stats[stats_qid].rx_xsk_bytes += pkt_len;
         }
