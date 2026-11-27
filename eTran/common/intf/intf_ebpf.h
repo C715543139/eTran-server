@@ -30,12 +30,11 @@
 
 #define MAX_TCP_FLOWS 65536
 
-#define QID_COUNTER_BYTE_BITS 37
-#define QID_COUNTER_PACKET (1ULL << QID_COUNTER_BYTE_BITS)
-#define QID_COUNTER_BYTE_MASK (QID_COUNTER_PACKET - 1)
+#define QID_COUNTER_PACKET_BITS 28
+#define QID_COUNTER_PACKET_MASK ((1ULL << QID_COUNTER_PACKET_BITS) - 1)
 
 struct bpf_qid_napi_stats {
-    // Each update adds one packet unit plus length. Decode the delta, not the absolute word.
+    // The low bits count packets. Decode the delta between snapshots, not the absolute word.
     __u64 rx_xsk;
     __u64 tx_direct;
     __u64 tw_enq_attempts;

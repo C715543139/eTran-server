@@ -254,7 +254,7 @@ int xdp_egress_prog(struct xdp_md *ctx)
 #if ETRAN_STATIC_QID_STATS
     __u32 qid = ctx->rx_queue_index;
     if (qid < MAX_NIC_QUEUES)
-        qid_napi_stats[qid].tx_direct += QID_COUNTER_PACKET + (__u64)(data_end - data);
+        qid_napi_stats[qid].tx_direct += ((__u64)(data_end - data) << QID_COUNTER_PACKET_BITS) | 1;
 #endif
     return XDP_TX;
 
@@ -382,7 +382,7 @@ int xdp_sock_prog(struct xdp_md *ctx)
             __u32 stats_qid = qid;
             barrier_var(stats_qid);
             stats_qid &= MAX_NIC_QUEUES - 1;
-            qid_napi_stats[stats_qid].rx_xsk += QID_COUNTER_PACKET + pkt_len;
+            qid_napi_stats[stats_qid].rx_xsk += ((__u64)pkt_len << QID_COUNTER_PACKET_BITS) | 1;
         }
 #endif
         return ret;

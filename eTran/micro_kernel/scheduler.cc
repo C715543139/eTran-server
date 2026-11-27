@@ -523,10 +523,10 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             const double hz = 1.0 / std::chrono::duration<double>(now - state.last).count();
             const auto rx = current.rx_xsk - state.napi.rx_xsk;
             const auto tx = current.tx_direct - state.napi.tx_direct;
-            const auto bytes = (rx & QID_COUNTER_BYTE_MASK) + (tx & QID_COUNTER_BYTE_MASK) +
+            const auto bytes = (rx >> QID_COUNTER_PACKET_BITS) + (tx >> QID_COUNTER_PACKET_BITS) +
                                wheel.tw_sent_bytes - state.wheel.tw_sent_bytes;
-            const auto rx_packets = rx >> QID_COUNTER_BYTE_BITS;
-            const auto direct_packets = tx >> QID_COUNTER_BYTE_BITS;
+            const auto rx_packets = rx & QID_COUNTER_PACKET_MASK;
+            const auto direct_packets = tx & QID_COUNTER_PACKET_MASK;
             const auto packets = rx_packets + direct_packets + wheel.tw_sent_pkts - state.wheel.tw_sent_pkts;
             state.rx_packets += rx_packets;
             state.direct_packets += direct_packets;
