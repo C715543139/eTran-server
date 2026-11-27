@@ -3104,6 +3104,17 @@ static void *control_loop(void *arg)
 int thread_init(void)
 {
     const auto &topology = etran_nic->_cpu_topology;
+    int control_rt_priority = 1;
+    if (const char *value = std::getenv("ETRAN_CP_RT_PRIO")) {
+        char *end = nullptr;
+        errno = 0;
+        const long parsed = strtol(value, &end, 10);
+        if (errno || end == value || *end || parsed < 0 || parsed > sched_get_priority_max(SCHED_FIFO)) {
+            fprintf(stderr, "Invalid ETRAN_CP_RT_PRIO: %s\n", value);
+            return -EINVAL;
+        }
+        control_rt_priority = static_cast<int>(parsed);
+    }
 #ifdef ALLOCATION
     const char *mode = std::getenv("ETRAN_SCHED_MODE");
     const char *enable = std::getenv("ETRAN_ADMISSION_ENABLE");
@@ -3198,6 +3209,15 @@ int thread_init(void)
         return -1;
     }
     printf("Control plane CPU: %d\n", topology.control);
+    if (control_rt_priority > 0) {
+        sched_param params{};
+        params.sched_priority = control_rt_priority;
+        if (const int error = pthread_setschedparam(micro_kernel_thread, SCHED_FIFO, &params))
+            fprintf(stderr, "Cannot set control-plane SCHED_FIFO priority %d: %s; keeping inherited scheduling\n",
+                    control_rt_priority, strerror(error));
+        else
+            printf("Control plane scheduling: SCHED_FIFO priority %d\n", control_rt_priority);
+    }
 
     return 0;
 }
