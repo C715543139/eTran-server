@@ -462,7 +462,7 @@ int eTran_init(struct eTran_cfg *cfg)
     size_t shm_lrpc_size;
     struct ucred cred;
     socklen_t ucred_len = sizeof(struct ucred);
-    int requested_app_cpu = -1;
+    register_cpu_request requested{};
 
     signal(SIGUSR1, eTran_intr);
     if (!cfg || 
@@ -475,16 +475,22 @@ int eTran_init(struct eTran_cfg *cfg)
         return -EEXIST;
 
 #ifdef ALLOCATION
-    const char *fixed_cpu = std::getenv("ETRAN_APP_CPU");
-    if (fixed_cpu && cfg->proto == IPPROTO_TCP) {
-        char *end = nullptr;
-        errno = 0;
-        long cpu = strtol(fixed_cpu, &end, 10);
-        if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= CPU_SETSIZE) {
-            fprintf(stderr, "Invalid application CPU: %s\n", fixed_cpu);
-            return -EINVAL;
+    if (cfg->proto == IPPROTO_TCP) {
+        const char *variables[] = {"ETRAN_APP_CPU", "ETRAN_IRQ_CPU"};
+        int32_t *targets[] = {&requested.app_cpu, &requested.irq_cpu};
+        for (size_t i = 0; i < 2; ++i) {
+            const char *fixed_cpu = std::getenv(variables[i]);
+            if (!fixed_cpu)
+                continue;
+            char *end = nullptr;
+            errno = 0;
+            const long cpu = strtol(fixed_cpu, &end, 10);
+            if (errno || end == fixed_cpu || *end || cpu < 0 || cpu >= CPU_SETSIZE) {
+                fprintf(stderr, "Invalid %s: %s\n", variables[i], fixed_cpu);
+                return -EINVAL;
+            }
+            *targets[i] = static_cast<int32_t>(cpu);
         }
-        requested_app_cpu = cpu;
     }
 #endif
 
@@ -525,7 +531,7 @@ int eTran_init(struct eTran_cfg *cfg)
     actx->pid = cred.pid;
 
     /* craft register request */
-    req.type = requested_app_cpu >= 0 ? REG_CPU_V2 : REG_V2;
+    req.type = requested.irq_cpu >= 0 ? REG_IRQ_CPU_V3 : requested.app_cpu >= 0 ? REG_CPU_V2 : REG_V2;
     req.proto = cfg->proto;
     req.nr_nic_queues = cfg->nr_nic_queues;
     req.nr_app_threads = cfg->nr_app_threads;
@@ -552,12 +558,13 @@ int eTran_init(struct eTran_cfg *cfg)
     if (write_all(actx->fd, &req, sizeof(req)) != sizeof(req))
         return -EIO;
 
-    if (req.type == REG_CPU_V2) {
+    if (req.type == REG_CPU_V2 || req.type == REG_IRQ_CPU_V3) {
         if (int rc = read_register_response(actx->fd, resp))
             return rc;
         if (resp.type != REG_CPU_READY)
             return -EPROTONOSUPPORT;
-        if (write_all(actx->fd, &requested_app_cpu, sizeof(requested_app_cpu)) != sizeof(requested_app_cpu))
+        const size_t length = req.type == REG_IRQ_CPU_V3 ? sizeof(requested) : sizeof(requested.app_cpu);
+        if (write_all(actx->fd, &requested, length) != static_cast<ssize_t>(length))
             return -EIO;
     }
 

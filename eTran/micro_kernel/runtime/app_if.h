@@ -36,6 +36,7 @@ struct app_ctx_per_thread
     worker_sched_ctrl *sched_ctrl = nullptr;
     int os_tid = 0;
     uint64_t os_start_time = 0;
+    std::chrono::steady_clock::time_point migration_cooldown{};
 
     int evfd;
 
@@ -68,7 +69,7 @@ struct app_ctx
     register_response uds_resp{};
     size_t uds_offset = 0;
     unsigned int uds_fd_batch = 0;
-    int uds_requested_cpu = -1;
+    register_cpu_request uds_cpu{};
     std::chrono::steady_clock::time_point uds_queue_deadline{};
     uint64_t uds_resource_epoch = 0;
     int registration_error = 0;
@@ -126,6 +127,7 @@ struct app_ctx
     // IRQ CPUs first, then application CPUs, with one entry per reservation.
     std::list<int> usedCores;
     int requested_app_cpu = -1;
+    int requested_irq_cpu = -1;
     #endif
 
     app_ctx() = default;

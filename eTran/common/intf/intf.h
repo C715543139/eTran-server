@@ -40,6 +40,13 @@ enum req_type {
     REG_CPU,
     REG_V2,
     REG_CPU_V2,
+    REG_IRQ_CPU_V3,
+};
+
+// Sent after REG_CPU_READY. REG_CPU_V2 carries only the first field.
+struct register_cpu_request {
+    int32_t app_cpu = -1;
+    int32_t irq_cpu = -1;
 };
 
 enum tcp_type {

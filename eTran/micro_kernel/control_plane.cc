@@ -101,6 +101,7 @@ static int cpuThroughputAppRefs[MAX_CPU];
 static bool scheduler_admission = false;
 static bool scheduler_degrade = false;
 static bool scheduler_manual = false;
+static bool scheduler_active = false;
 static unsigned int quarantine_refs[MAX_CPU];
 static std::array<std::atomic<uint64_t>, MAX_NIC_QUEUES> irq_owner_tokens{};
 enum class CpuRole { Irq, App };
@@ -862,9 +863,9 @@ static int place_new_tcp_app(app_ctx &app, int fixed_irq)
 }
 
 static int bind_rss_core(struct app_ctx *actx, const std::vector<unsigned int> &qids, bool deferred) {
-    int irq_cpu = -1;
+    int irq_cpu = actx->requested_irq_cpu;
     const char *fixed_cpu = std::getenv(actx->tcp_type == LATENCY ? "ETRAN_LATENCY_CPU" : "ETRAN_THROUGHPUT_CPU");
-    if (fixed_cpu) {
+    if (irq_cpu < 0 && fixed_cpu) {
         char *end = nullptr;
         errno = 0;
         long cpu = strtol(fixed_cpu, &end, 10);
@@ -916,12 +917,17 @@ struct WorkerMigrationRequest {
     unsigned int slot;
     int cpu;
     uint64_t start_time;
+    uint64_t generation = 0;
+    uint64_t worker_start = 0;
+    int expected_source = -1;
 };
 
 struct IrqMigrationRequest {
     unsigned int qid;
     int cpu;
     uint64_t generation;
+    int expected_source = -1;
+    bool merge = false;
 };
 
 static std::mutex migration_request_mutex;
@@ -1012,6 +1018,7 @@ class MigrationExecutor {
     std::vector<Move> quarantined;
     std::vector<IrqMove> irq_holds;
     Clock::time_point backoff_until{};
+    std::array<std::pair<uint64_t, Clock::time_point>, MAX_NIC_QUEUES> irq_cooldown{};
     uint32_t next_seq = 0;
     uint64_t next_irq_token = 0;
 
@@ -1078,6 +1085,8 @@ class MigrationExecutor {
                 state, static_cast<unsigned long long>(move.app->generation), move.qid,
                 static_cast<unsigned long long>(move.token), move.src, move.dst);
         scheduler_track_irq_handoff(move.qid, false);
+        if (!move.cancelled)
+            backoff_until = Clock::now() + std::chrono::seconds(1);
         irq_action.reset();
     }
 
@@ -1098,6 +1107,8 @@ class MigrationExecutor {
     }
 
 public:
+    bool busy() const { return action || irq_action || Clock::now() < backoff_until; }
+
     int start(WorkerMigrationRequest request)
     {
         if (action || irq_action || Clock::now() < backoff_until)
@@ -1109,7 +1120,8 @@ public:
         if (it == active_apps.apps.end())
             return -ENOENT;
         auto *app = *it;
-        if (read_worker_state(worker_task_path(*app, request.pid)).start_time != request.start_time)
+        if (request.generation ? request.generation != app->generation :
+            read_worker_state(worker_task_path(*app, request.pid)).start_time != request.start_time)
             return -ESTALE;
         if (request.slot >= app->nr_app_threads || !valid_pool_cpu(request.cpu))
             return -EINVAL;
@@ -1118,6 +1130,9 @@ public:
             return -EAGAIN;
         Move move{app, request.slot, -1, request.cpu, State::Migrating, 0, {}, false};
         move.src = worker_cpu(move);
+        if (request.generation && (app->requested_app_cpu >= 0 || move.src != request.expected_source ||
+            worker.os_start_time != request.worker_start || Clock::now() < worker.migration_cooldown))
+            return -ESTALE;
         if (move.src == move.dst)
             return -EALREADY;
         if (quarantine_refs[move.src] || quarantine_refs[move.dst])
@@ -1151,6 +1166,10 @@ public:
                     continue;
                 IrqMove move{app, slot, request.qid, -1, request.cpu};
                 move.src = irq_cpu(move);
+                const auto &[owner, cooldown] = irq_cooldown[move.qid];
+                if (request.expected_source >= 0 && (app->requested_irq_cpu >= 0 || move.src != request.expected_source ||
+                    (owner == app->generation && Clock::now() < cooldown)))
+                    return -ESTALE;
                 if (move.src == move.dst)
                     return -EALREADY;
                 if (quarantine_refs[move.src] || quarantine_refs[move.dst])
@@ -1158,7 +1177,10 @@ public:
                 const bool own_app = app->tcp_type != THROUGHPUT && app->nr_nic_queues == 1 &&
                                      app->nr_app_threads == 1 && app->usedCores.back() == move.dst &&
                                      cpuUseRef[move.dst] == 1 && scheduler_queue_is_light(move.qid);
-                if (cpuUseRef[move.dst] && !own_app)
+                const bool merge = request.merge && cpuIrqRefs[move.dst] > 0 &&
+                                   cpuIrqRefs[move.dst] == cpuUseRef[move.dst] && !cpuLatUseRef[move.dst] &&
+                                   scheduler_can_merge_irq(move.qid, move.dst);
+                if (cpuUseRef[move.dst] && !own_app && !merge)
                     return -EBUSY;
                 if (int rc = reserve_cpu(app->tcp_type, CpuRole::Irq, move.dst); rc < 0)
                     return rc;
@@ -1229,6 +1251,8 @@ public:
             irq_cpu(move) = move.dst;
             scheduler_update_irq_cpu(move.qid, move.app->pid, move.dst);
             release_cpu(*move.app, CpuRole::Irq, move.src);
+            ++resource_epoch;
+            irq_cooldown[move.qid] = {move.app->generation, Clock::now() + std::chrono::milliseconds(200)};
         }
         fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld\n",
                 move.qid, target, rollback, static_cast<unsigned long long>(current.done - move.base.done),
@@ -1257,10 +1281,14 @@ public:
                 backoff_until = Clock::now() + std::chrono::seconds(1);
             } else {
                 worker_cpu(move) = move.dst;
+                worker.migration_cooldown = Clock::now() + std::chrono::milliseconds(200);
+                scheduler_register_worker_slot(move.app->generation, move.slot, move.dst, move.app->tcp_type,
+                                               move.app->pid, worker.os_start_time, move.app->requested_app_cpu >= 0);
                 if (move.app->nr_app_threads == 1)
                     for (unsigned int i = 0; i < move.app->nr_nic_queues; ++i)
                         scheduler_update_app_cpu(move.app->nic_qid[i], move.app->pid, move.dst);
                 release_cpu(*move.app, CpuRole::App, move.src);
+                ++resource_epoch;
             }
             fprintf(stderr, "sched_migration state=CONFIRM pid=%d slot=%u seq=%u cpu=%d rollback=%d elapsed_us=%lld\n",
                     move.app->pid, move.slot, move.seq, target, rolling_back,
@@ -1276,6 +1304,7 @@ public:
             ++quarantine_refs[move.src];
             ++quarantine_refs[move.dst];
             quarantined.push_back(move);
+            backoff_until = Clock::now() + std::chrono::seconds(1);
             fprintf(stderr, "sched_migration state=QUARANTINED pid=%d slot=%u seq=%u src=%d dst=%d\n",
                     move.app->pid, move.slot, move.seq, move.src, move.dst);
             action.reset();
@@ -1338,6 +1367,47 @@ public:
 };
 
 static MigrationExecutor migration_executor;
+
+static void poll_active_scheduler()
+{
+    using Clock = std::chrono::steady_clock;
+    using Kind = SchedulerAction::Kind;
+    using Reason = SchedulerAction::Reason;
+    static Clock::time_point next_poll;
+    const auto now = Clock::now();
+    if (now < next_poll)
+        return;
+    next_poll = now + std::chrono::milliseconds(5);
+    SchedulerPlacement placement;
+    for (int cpu : etran_nic->_cpu_topology.pool)
+        placement.cores[cpu] = {cpuUseRef[cpu] - cpuIrqRefs[cpu], cpuIrqRefs[cpu], cpuLatUseRef[cpu],
+                                quarantine_refs[cpu] != 0};
+    placement.busy = migration_executor.busy();
+    auto action = scheduler_exchange_placement(placement);
+    if (placement.busy || !action)
+        return;
+    const auto &move = *action;
+    const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(now.time_since_epoch()).count();
+    if (move.kind == Kind::Degraded) {
+        if (irq_owner_tokens[move.slot].load(std::memory_order_acquire) == move.generation)
+            fprintf(stderr, "sched_decision mode=active state=DEGRADED reason=irq_cap_exceeded qid=%u gen=%llu src=%d mono_us=%lld\n",
+                    move.slot, static_cast<unsigned long long>(move.generation), move.source,
+                    static_cast<long long>(mono_us));
+        return;
+    }
+    const int rc = move.kind == Kind::Worker ?
+        migration_executor.start(WorkerMigrationRequest{move.pid, move.slot, move.target, 0,
+                                   move.generation, move.worker_start, move.source}) :
+        migration_executor.start(IrqMigrationRequest{move.slot, move.target, move.generation, move.source,
+                                move.reason == Reason::Merge});
+    if (rc)
+        return;
+    constexpr const char *reasons[] = {"R1", "R2", "R3", "R4", "S1", "expand", "fold", "irq_cap_exceeded"};
+    fprintf(stderr, "sched_decision mode=active state=ACTUATING reason=%s kind=%s gen=%llu pid=%d slot=%u src=%d dst=%d mono_us=%lld\n",
+            reasons[static_cast<unsigned>(move.reason)], move.kind == Kind::Worker ? "worker" : "irq",
+            static_cast<unsigned long long>(move.generation), move.pid, move.slot, move.source, move.target,
+            static_cast<long long>(mono_us));
+}
 
 static void poll_worker_migration()
 {
@@ -2018,7 +2088,9 @@ static void finish_registration(app_ctx &app)
         auto irq_cpu = app.usedCores.begin();
         const int app_cpu = app.nr_app_threads == 1 ? app.usedCores.back() : -1;
         for (unsigned int i = 0; i < app.nr_nic_queues; ++i, ++irq_cpu)
-            scheduler_register_queue(app.nic_qid[i], app.pid, app.tcp_type, *irq_cpu, app_cpu);
+            scheduler_register_queue(app.nic_qid[i], app.pid, app.tcp_type, *irq_cpu, app_cpu,
+                                     app.generation, app.nr_nic_queues == 1 && app.nr_app_threads == 1,
+                                     app.requested_irq_cpu >= 0);
     }
     if (scheduler_manual && app.proto == IPPROTO_TCP && !app.use_shared_queues)
         for (unsigned int i = 0; i < app.nr_nic_queues; ++i)
@@ -2334,6 +2406,15 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (!actx)
         return -ENOENT;
 
+#ifdef ALLOCATION
+    if (actx->uds_cpu.irq_cpu < -1 ||
+        (actx->uds_cpu.irq_cpu >= 0 && (req.proto != IPPROTO_TCP || req.queue_usage != Q_EXCLUSIVE ||
+                                      !valid_pool_cpu(actx->uds_cpu.irq_cpu))))
+        return -EINVAL;
+    if (actx->uds_cpu.irq_cpu >= 0 && quarantine_refs[actx->uds_cpu.irq_cpu])
+        return -EBUSY;
+#endif
+
     if (req.proto == IPPROTO_TCP && req.queue_usage == Q_EXCLUSIVE &&
         std::any_of(active_apps.apps.begin(), active_apps.apps.end(), [&](const auto *app) {
             return app != actx && app->pid == actx->pid && (app->managed_tcp || app->done);
@@ -2372,11 +2453,14 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     actx->tcp_type = req.tcp_type;
     actx->usedCores = std::list<int>();
     actx->requested_app_cpu = requested_app_cpu;
+    actx->requested_irq_cpu = actx->uds_cpu.irq_cpu;
     if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
         if (int rc = bind_rss_core(actx, qids, true)) {
             return_resources(*actx);
             if (rc == -ENOSPC && std::any_of(active_apps.apps.begin(), active_apps.apps.end(),
                 [&](const auto *app) { return app != actx && tcp_app_is_retiring(*app); }))
+                return -EAGAIN;
+            if (rc == -ENOSPC && scheduler_active && scheduler_request_admission_fold())
                 return -EAGAIN;
             return rc;
         }
@@ -2671,7 +2755,7 @@ static bool uds_wants_write(UdsState state)
 
 static void start_uds_registration(app_ctx &app)
 {
-    const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_requested_cpu);
+    const int error = alloc_app_resources(app.uds_req, app.fd, app.uds_cpu.app_cpu);
     if (error == -EINPROGRESS)
         return;
     if (error == -EAGAIN) {
@@ -2692,7 +2776,8 @@ static int poll_uds_request(app_ctx &app)
         app.uds_state == UdsState::WaitTeardown)
         return -EPROTO;
     if (app.uds_state == UdsState::RecvCpu) {
-        int rc = poll_uds_frame(app, &app.uds_requested_cpu, sizeof(app.uds_requested_cpu), false);
+        const size_t length = app.uds_req.type == REG_IRQ_CPU_V3 ? sizeof(app.uds_cpu) : sizeof(app.uds_cpu.app_cpu);
+        int rc = poll_uds_frame(app, &app.uds_cpu, length, false);
         if (rc <= 0)
             return rc;
     } else {
@@ -2703,7 +2788,7 @@ static int poll_uds_request(app_ctx &app)
             return app.uds_req.type == UNREG ? -ECONNABORTED : -EPROTO;
         if (app.uds_req.type == REG || app.uds_req.type == REG_CPU)
             return -EPROTONOSUPPORT;
-        if (app.uds_req.type == REG_CPU_V2) {
+        if (app.uds_req.type == REG_CPU_V2 || app.uds_req.type == REG_IRQ_CPU_V3) {
             prepare_uds_response(app, UdsState::SendCpuReady, REG_CPU_READY);
             return 1;
         }
@@ -3052,6 +3137,8 @@ static void *control_loop(void *arg)
 #ifdef ALLOCATION
         if (scheduler_manual)
             poll_worker_migration();
+        if (scheduler_active)
+            poll_active_scheduler();
 #endif
 
         /* poll network packets */
@@ -3124,8 +3211,9 @@ int thread_init(void)
         fprintf(stderr, "Invalid scheduler admission configuration\n");
         return -EINVAL;
     }
-    scheduler_admission = (mode && strcmp(mode, "admit_only") == 0) || (enable && strcmp(enable, "1") == 0);
-    scheduler_manual = mode && strcmp(mode, "manual_actuate") == 0;
+    scheduler_active = mode && strcmp(mode, "active") == 0;
+    scheduler_admission = scheduler_active || (mode && strcmp(mode, "admit_only") == 0) || (enable && strcmp(enable, "1") == 0);
+    scheduler_manual = scheduler_active || (mode && strcmp(mode, "manual_actuate") == 0);
     scheduler_degrade = policy && strcmp(policy, "degrade") == 0;
     latUsingCores.clear();
     throughputUsingCores.clear();
@@ -3434,7 +3522,8 @@ static void process_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg_in)
                     tctx->os_start_time = read_worker_state(worker_task_path(*app, identity.os_tid)).start_time;
                 auto cpu = app->usedCores.begin();
                 std::advance(cpu, app->nr_nic_queues + identity.worker_idx);
-                scheduler_register_worker_slot(app->generation, identity.worker_idx, *cpu, app->tcp_type);
+                scheduler_register_worker_slot(app->generation, identity.worker_idx, *cpu, app->tcp_type,
+                                               app->pid, tctx->os_start_time, app->requested_app_cpu >= 0);
 #endif
                 if (!app->use_shared_queues && app->nr_app_threads == 1)
                     for (unsigned int i = 0; i < app->nr_nic_queues; ++i)

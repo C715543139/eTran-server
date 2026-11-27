@@ -41,11 +41,40 @@ struct Settings {
     bool shadow = mode && strcmp(mode, "shadow") == 0;
     bool admit_only = mode && strcmp(mode, "admit_only") == 0;
     bool manual = mode && strcmp(mode, "manual_actuate") == 0;
+    bool active = mode && strcmp(mode, "active") == 0;
     bool sample = !sample_flag || strcmp(sample_flag, "0") != 0;
     bool probe_enabled = probe && strcmp(probe, "1") == 0;
-    bool qid_enabled = shadow || admit_only || manual || (qid && strcmp(qid, "1") == 0);
+    bool qid_enabled = shadow || admit_only || manual || active || (qid && strcmp(qid, "1") == 0);
     bool verbose = shadow || (verbose_flag && strcmp(verbose_flag, "1") == 0);
 };
+
+struct ActiveLimits {
+    double bps = 22e9, pps = 2e6;
+    bool irq_to_app = false;
+
+    bool load()
+    {
+        const char *names[] = {"ETRAN_SCHED_CAP_BPS", "ETRAN_SCHED_CAP_PPS"};
+        double *values[] = {&bps, &pps};
+        for (size_t i = 0; i < std::size(names); ++i) {
+            if (const char *value = std::getenv(names[i])) {
+                char *end = nullptr;
+                errno = 0;
+                *values[i] = strtod(value, &end);
+                if (errno || end == value || *end || !std::isfinite(*values[i]) || *values[i] <= 0)
+                    return false;
+            }
+        }
+        if (const char *fold = std::getenv("ETRAN_FOLD_MODE")) {
+            irq_to_app = strcmp(fold, "irq_to_app") == 0;
+            if (!irq_to_app && strcmp(fold, "app_to_irq") != 0)
+                return false;
+        }
+        return true;
+    }
+};
+
+ActiveLimits active_limits;
 
 struct Thresholds {
     double b_high = 3e9, b_low = 1.5e9;
@@ -130,6 +159,9 @@ struct Registration {
     int app_cpu = -1;
     int tid = 0;
     bool irq_handoff = false;
+    uint64_t owner = 0;
+    bool single_worker_queue = false;
+    bool fixed_irq = false;
 };
 
 enum class Profile { Unknown, Idle, Light, Heavy };
@@ -182,9 +214,19 @@ struct WorkerSlot {
     uint64_t generation;
     unsigned int slot;
     int cpu, slo;
+    int pid;
+    uint64_t start_time;
+    bool fixed;
 };
 std::vector<WorkerSlot> workers;
 std::mutex registration_mutex;
+SchedulerPlacement active_placement;
+std::optional<SchedulerAction> pending_action;
+struct QueueRate {
+    Clock::time_point time{};
+    double bps = 0, pps = 0, irq_share = -1;
+};
+std::array<QueueRate, MAX_NIC_QUEUES> last_rates;
 std::thread sampler;
 std::condition_variable sampler_wake;
 std::mutex sampler_mutex;
@@ -405,6 +447,198 @@ void report_shadow(const std::array<Registration, MAX_NIC_QUEUES> &snapshot,
     }
 }
 
+bool light_queue(Profile profile)
+{
+    return profile == Profile::Light || profile == Profile::Idle;
+}
+
+bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now)
+{
+    const auto &source = registrations[qid];
+    const auto &target = active_placement.cores[cpu];
+    if (!source.pid || source.slo == LATENCY || source.irq_cpu == cpu || !target.irq || target.app ||
+        target.latency || target.quarantined)
+        return false;
+    double bps = 0, pps = 0;
+    int confirmed = 0;
+    for (unsigned q = 0; q < registrations.size(); ++q) {
+        const auto &slot = registrations[q];
+        if (!slot.pid || (q != qid && slot.irq_cpu != cpu))
+            continue;
+        const auto &rate = last_rates[q];
+        if (slot.slo == LATENCY || slot.irq_handoff || last_profiles[q] == Profile::Unknown ||
+            now - rate.time > 2 * sample_period)
+            return false;
+        confirmed += q != qid;
+        bps += rate.bps;
+        pps += rate.pps;
+    }
+    const auto probe_room = [&] {
+        if (!settings().probe_enabled)
+            return true;
+        auto other = std::find_if(registrations.begin(), registrations.end(), [cpu](const auto &q) {
+            return q.pid && q.irq_cpu == cpu;
+        });
+        if (other == registrations.end())
+            return false;
+        const auto a = last_rates[qid].irq_share, b = last_rates[other - registrations.begin()].irq_share;
+        return a >= 0 && b >= 0 && a + b <= .85;
+    };
+    return confirmed == target.irq && bps <= active_limits.bps && pps <= active_limits.pps && probe_room();
+}
+
+std::optional<SchedulerAction> select_active_action(const std::vector<int> &pool, Clock::time_point now)
+{
+    using Action = SchedulerAction;
+    using Kind = Action::Kind;
+    using Reason = Action::Reason;
+    static std::array<uint64_t, MAX_NIC_QUEUES> degraded_owner{};
+    static std::array<uint64_t, MAX_NIC_QUEUES> light_conflict{};
+    static std::array<bool, MAX_CPU> worker_conflict{};
+    static int last_spare = -1;
+    static Clock::time_point spare_since{};
+
+    const auto &cores = active_placement.cores;
+    auto usable = [&](int cpu) { return cpu >= 0 && cpu < MAX_CPU && !cores[cpu].quarantined; };
+    auto spare_it = std::find_if(pool.begin(), pool.end(), [&](int cpu) {
+        return usable(cpu) && !cores[cpu].app && !cores[cpu].irq;
+    });
+    const int spare = spare_it == pool.end() ? -1 : *spare_it;
+    if (spare != last_spare || active_placement.busy) {
+        spare_since = now;
+        last_spare = spare;
+    }
+    if (active_placement.busy) {
+        light_conflict.fill(0);
+        worker_conflict.fill(false);
+        return {};
+    }
+
+    auto irq_move = [&](unsigned qid, int target, Reason reason) {
+        const auto &q = registrations[qid];
+        return Action{Kind::Irq, reason, q.owner, qid, q.pid, q.irq_cpu, target};
+    };
+    auto worker_move = [](const WorkerSlot &slot, int target, Reason reason) {
+        return Action{Kind::Worker, reason, slot.generation, slot.slot, slot.pid, slot.cpu, target, slot.start_time};
+    };
+    auto movable_irq = [&](unsigned qid) {
+        const auto &q = registrations[qid];
+        return q.pid && !q.fixed_irq && !q.irq_handoff && usable(q.irq_cpu);
+    };
+    auto own_light_app = [&](unsigned int qid) {
+        const auto &q = registrations[qid];
+        return q.single_worker_queue && q.slo != THROUGHPUT && light_queue(last_profiles[qid]) &&
+               usable(q.app_cpu) && q.app_cpu != q.irq_cpu && cores[q.app_cpu].app == 1 && !cores[q.app_cpu].irq;
+    };
+    bool redline = false;
+    for (unsigned qid = 0; qid < registrations.size(); ++qid) {
+        const auto &q = registrations[qid];
+        if (!movable_irq(qid) || q.slo == LATENCY || last_profiles[qid] != Profile::Heavy)
+            continue;
+        for (unsigned j = 0; j < registrations.size(); ++j) {
+            const auto &lat = registrations[j];
+            if (!lat.pid || lat.slo != LATENCY || lat.irq_cpu != q.irq_cpu || !light_queue(last_profiles[j]))
+                continue;
+            spare_since = now;
+            redline = true;
+            if (spare >= 0)
+                return irq_move(qid, spare, Reason::R4);
+            if (movable_irq(j) && own_light_app(j))
+                return irq_move(j, lat.app_cpu, Reason::R4);
+        }
+    }
+    for (unsigned qid = 0; qid < registrations.size(); ++qid) {
+        const auto &q = registrations[qid];
+        const bool heavy_shared = movable_irq(qid) && cores[q.irq_cpu].app && last_profiles[qid] == Profile::Heavy;
+        if (!heavy_shared) {
+            degraded_owner[qid] = 0;
+            continue;
+        }
+        spare_since = now;
+        redline = true;
+        if (spare >= 0)
+            return irq_move(qid, spare, Reason::R1);
+        if (q.slo == LATENCY)
+            continue;
+        for (int cpu : pool)
+            if (can_merge_irq(qid, cpu, now))
+                return irq_move(qid, cpu, Reason::Merge);
+        if (degraded_owner[qid] != q.owner) {
+            degraded_owner[qid] = q.owner;
+            return Action{Kind::Degraded, Reason::Capacity, q.owner, qid, q.pid, q.irq_cpu, -1};
+        }
+    }
+    for (unsigned qid = 0; qid < registrations.size(); ++qid) {
+        const auto &q = registrations[qid];
+        if (!movable_irq(qid) || !light_queue(last_profiles[qid]) ||
+            !std::any_of(workers.begin(), workers.end(), [&](const auto &w) {
+                return w.cpu == q.irq_cpu && w.slo == THROUGHPUT;
+            })) {
+            light_conflict[qid] = 0;
+            continue;
+        }
+        redline = true;
+        spare_since = now;
+        if (light_conflict[qid] != q.owner) {
+            light_conflict[qid] = q.owner;
+            continue;
+        }
+        if (spare >= 0)
+            return irq_move(qid, spare, Reason::R2);
+        if (own_light_app(qid))
+            return irq_move(qid, q.app_cpu, Reason::R2);
+    }
+    for (int cpu : pool) {
+        if (cores[cpu].app <= 1) {
+            worker_conflict[cpu] = false;
+            continue;
+        }
+        redline = true;
+        spare_since = now;
+        if (!worker_conflict[cpu]) {
+            worker_conflict[cpu] = true;
+            continue;
+        }
+        if (spare < 0 || !usable(cpu))
+            continue;
+        auto select = [&](bool latency) {
+            return std::find_if(workers.begin(), workers.end(), [&](const auto &w) {
+                return w.cpu == cpu && !w.fixed && w.start_time && (!latency || w.slo == LATENCY);
+            });
+        };
+        auto slot = select(true);
+        if (slot == workers.end())
+            slot = select(false);
+        if (slot != workers.end())
+            return worker_move(*slot, spare, Reason::R3);
+    }
+    if (redline || spare < 0 || now - spare_since < std::chrono::milliseconds(500))
+        return {};
+    auto folded = [&](unsigned qid) {
+        const auto &q = registrations[qid];
+        return q.single_worker_queue && q.irq_cpu == q.app_cpu && usable(q.irq_cpu) &&
+               cores[q.irq_cpu].irq == 1 && cores[q.irq_cpu].app == 1;
+    };
+    for (unsigned qid = 0; qid < registrations.size(); ++qid)
+        if (movable_irq(qid) && folded(qid) && (registrations[qid].slo == THROUGHPUT ||
+                                               last_profiles[qid] == Profile::Heavy))
+            return irq_move(qid, spare, Reason::Expand);
+    for (unsigned qid = 0; qid < registrations.size(); ++qid) {
+        const auto &q = registrations[qid];
+        if (!q.pid || !folded(qid) || !light_queue(last_profiles[qid]))
+            continue;
+        auto worker = std::find_if(workers.begin(), workers.end(), [&](const auto &slot) {
+            return slot.generation == q.owner && !slot.fixed && slot.start_time;
+        });
+        if (worker != workers.end())
+            return worker_move(*worker, spare, Reason::Expand);
+    }
+    for (unsigned qid = 0; qid < registrations.size(); ++qid)
+        if (movable_irq(qid) && cores[registrations[qid].irq_cpu].irq > 1 && last_profiles[qid] == Profile::Heavy)
+            return irq_move(qid, spare, Reason::Expand);
+    return {};
+}
+
 void update_wait(const Registration &app, QueueSample &state, double hz)
 {
     if (app.tid != state.tid) {
@@ -614,7 +848,12 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                     last_profiles[qid] = state.sampled && !state.drops && !progress[qid].stalled &&
                                          flow_versions[qid] == flow_revisions[qid]
                                          ? state.profile : Profile::Unknown;
-                    if (settings().manual) {
+                    if (settings().active) {
+                        const auto &cpu = cores[snapshot[qid].irq_cpu];
+                        last_rates[qid] = {state.sampled ? now : Clock::time_point{}, state.bps, state.pps,
+                                          cpu.valid_probe ? cpu.rx + cpu.tx : -1};
+                    }
+                    if (settings().manual || settings().active) {
                         auto &irq = last_irq_progress[qid];
                         const auto packets = state.rx_packets + state.direct_packets +
                                              state.wheel.tw_sent_pkts;
@@ -630,10 +869,12 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                     }
                 }
             }
-            if (settings().manual) {
+            if (settings().manual || settings().active) {
                 last_pending = pending;
                 pending_is_valid = have_pending;
             }
+            if (settings().active && !pending_action)
+                pending_action = select_active_action(pool, now);
         }
         if (have_probe)
             last_probe.swap(softirq);
@@ -656,6 +897,56 @@ bool scheduler_queue_is_light(unsigned int qid)
     return registrations[qid].pid && (last_profiles[qid] == Profile::Light || last_profiles[qid] == Profile::Idle);
 }
 
+std::optional<SchedulerAction> scheduler_exchange_placement(const SchedulerPlacement &placement)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    active_placement = placement;
+    std::optional<SchedulerAction> result;
+    result.swap(pending_action);
+    return result;
+}
+
+bool scheduler_can_merge_irq(unsigned int qid, int cpu)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    return can_merge_irq(qid, cpu, Clock::now());
+}
+
+bool scheduler_request_admission_fold()
+{
+    using Kind = SchedulerAction::Kind;
+    using Reason = SchedulerAction::Reason;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    if (active_placement.busy || pending_action)
+        return false;
+    const auto now = Clock::now();
+    for (unsigned qid = 0; qid < registrations.size(); ++qid) {
+        const auto &q = registrations[qid];
+        if (!q.pid || q.slo != LATENCY || !q.single_worker_queue || q.irq_handoff || q.app_cpu < 0 ||
+            q.irq_cpu == q.app_cpu || !light_queue(last_profiles[qid]) || now - last_rates[qid].time > 2 * sample_period)
+            continue;
+        const auto &source = active_placement.cores[q.app_cpu];
+        const auto &target = active_placement.cores[q.irq_cpu];
+        if (source.app != 1 || source.irq || source.quarantined || target.app || target.irq != 1 || target.quarantined)
+            continue;
+        if (active_limits.irq_to_app) {
+            if (q.fixed_irq)
+                continue;
+            pending_action = SchedulerAction{Kind::Irq, Reason::Fold, q.owner, qid, q.pid, q.irq_cpu, q.app_cpu};
+        } else {
+            auto w = std::find_if(workers.begin(), workers.end(), [&](const auto &slot) {
+                return slot.generation == q.owner && !slot.fixed && slot.start_time;
+            });
+            if (w == workers.end())
+                continue;
+            pending_action = SchedulerAction{Kind::Worker, Reason::Fold, q.owner, w->slot, q.pid,
+                                              q.app_cpu, q.irq_cpu, w->start_time};
+        }
+        return true;
+    }
+    return false;
+}
+
 SchedulerIrqProgress scheduler_irq_progress(unsigned int qid, int source, int target)
 {
     const auto now = Clock::now();
@@ -674,15 +965,20 @@ void scheduler_track_irq_handoff(unsigned int qid, bool moving)
     registrations[qid].irq_handoff = moving;
 }
 
-void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, int app_cpu)
+void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, int app_cpu,
+                              uint64_t owner, bool single_worker_queue, bool fixed_irq)
 {
     if (!scheduler_collect_qid_stats())
         return;
     std::lock_guard<std::mutex> lock(registration_mutex);
     auto &entry = registrations[qid];
     entry = {entry.generation + 1, pid, slo, irq_cpu, app_cpu};
+    entry.owner = owner;
+    entry.single_worker_queue = single_worker_queue;
+    entry.fixed_irq = fixed_irq;
     last_profiles[qid] = Profile::Unknown;
     last_irq_progress[qid] = {};
+    last_rates[qid] = {};
 }
 
 void scheduler_unregister_queue(unsigned int qid)
@@ -749,23 +1045,24 @@ void scheduler_update_irq_cpu(unsigned int qid, int pid, int cpu)
         entry.irq_cpu = cpu;
 }
 
-void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo)
+void scheduler_register_worker_slot(uint64_t generation, unsigned int slot, int cpu, int slo,
+                                    int pid, uint64_t start_time, bool fixed)
 {
-    if (!settings().shadow || cpu < 0 || cpu >= MAX_CPU)
+    if (!(settings().shadow || settings().active) || cpu < 0 || cpu >= MAX_CPU)
         return;
     std::lock_guard<std::mutex> lock(registration_mutex);
     auto existing = std::find_if(workers.begin(), workers.end(), [=](const auto &worker) {
         return worker.generation == generation && worker.slot == slot;
     });
     if (existing == workers.end())
-        workers.push_back({generation, slot, cpu, slo});
+        workers.push_back({generation, slot, cpu, slo, pid, start_time, fixed});
     else
-        *existing = {generation, slot, cpu, slo};
+        *existing = {generation, slot, cpu, slo, pid, start_time, fixed};
 }
 
 void scheduler_unregister_workers(uint64_t generation)
 {
-    if (!settings().shadow)
+    if (!(settings().shadow || settings().active))
         return;
     std::lock_guard<std::mutex> lock(registration_mutex);
     workers.erase(std::remove_if(workers.begin(), workers.end(), [generation](const auto &worker) {
@@ -777,8 +1074,8 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
                     int tw_pending_fd, const bpf_cc_map_user *cc)
 {
     const auto &config = settings();
-    if (config.mode && strcmp(config.mode, "off") && !config.shadow && !config.admit_only && !config.manual) {
-        fprintf(stderr, "ETRAN_SCHED_MODE must be off, shadow, admit_only, or manual_actuate\n");
+    if (config.mode && strcmp(config.mode, "off") && !config.shadow && !config.admit_only && !config.manual && !config.active) {
+        fprintf(stderr, "ETRAN_SCHED_MODE must be off, shadow, admit_only, manual_actuate, or active\n");
         return -EINVAL;
     }
     if (config.probe_enabled && !config.qid_enabled) {
@@ -788,13 +1085,17 @@ int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_f
     if (!config.qid_enabled && !config.probe_enabled)
         return 0;
     if (!config.sample) {
-        if (config.shadow || config.admit_only || config.manual || config.probe_enabled) {
+        if (config.shadow || config.admit_only || config.manual || config.active || config.probe_enabled) {
             fprintf(stderr, "ETRAN_QID_STATS_SAMPLE=0 is only for counters-only off-mode comparisons\n");
             return -EINVAL;
         }
         return 0;
     }
     Thresholds limits;
+    if (config.active && !active_limits.load()) {
+        fprintf(stderr, "Invalid active scheduler cap or fold mode\n");
+        return -EINVAL;
+    }
     if (!limits.load()) {
         fprintf(stderr, "Scheduler high thresholds must exceed low thresholds; softirq ratios must be in [0, 1]\n");
         return -EINVAL;
