@@ -156,7 +156,7 @@ static void destroy_rss_context(struct app_ctx *actx);
 
 /* manage application resources */
 static int alloc_app_resources(struct register_request &req, int fd, int requested_app_cpu);
-static void free_app_resources(struct app_ctx *actx, bool return_queues = true);
+static void free_app_resources(struct app_ctx *actx);
 
 /* called when microkernel exits */
 static void destroy_all_apps(void);
@@ -190,21 +190,63 @@ struct IrqResult {
     IrqWork operation;
     IrqHandoffSample sample;
     bool attempted = false;
+    std::chrono::steady_clock::time_point write_started{};
+};
+
+constexpr size_t lrpc_control_offset = (sizeof(head_wb) + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE) * 2;
+static_assert(sizeof(head_wb) == 64 && sizeof(lrpc_msg) == 64, "scheduler control alignment");
+
+struct ManagedTcpResources {
+    buffer_pool_wrapper bpw{};
+    int umem_id = -1;
+    int rss_context = 0;
+    std::vector<xsk_socket_info *> controls;
+    std::vector<int> data_fds;
+    std::vector<shm_wrapper *> lrpcs;
+    std::vector<int> event_fds;
+    std::vector<int> rule_ids;
+};
+
+struct PrepRequest {
+    int pid;
+    unsigned int threads;
+    bool busy_poll;
+};
+
+struct FlowRuleWork {
+    uint32_t key;
+    int rss;
+    int id = -1;
+};
+
+enum class RuleState { Adding, Installed, AddFailed, Deleting, DeleteFailed };
+
+struct ManagedFlowRule {
+    app_ctx *owner;
+    RuleState state = RuleState::Adding;
+    unsigned int users = 0;
+    int id = -1;
+    std::vector<uint64_t> waiters;
+    std::vector<uint16_t> held_ports;
 };
 
 struct RssJob {
     uint64_t generation;
-    int remove_context;
     std::vector<std::pair<unsigned int, int>> placement;
     std::optional<IrqWork> irq = std::nullopt;
+    std::optional<PrepRequest> prepare = std::nullopt;
+    std::unique_ptr<ManagedTcpResources> teardown = nullptr;
+    std::optional<FlowRuleWork> rule = std::nullopt;
 };
 
 struct RssResult {
     uint64_t generation;
-    int remove_context;
-    int context;
-    int error;
+    int context = 0;
+    int error = 0;
     std::optional<IrqResult> irq = std::nullopt;
+    std::unique_ptr<ManagedTcpResources> resources = nullptr;
+    bool teardown = false;
+    std::optional<FlowRuleWork> rule = std::nullopt;
 };
 
 static std::mutex rss_mutex;
@@ -213,15 +255,25 @@ static std::deque<RssJob> rss_jobs;
 static std::vector<RssResult> rss_results;
 static std::thread rss_thread;
 static bool rss_stopping;
+static size_t mgmt_outstanding;
+static uint64_t resource_epoch;
+static std::unordered_map<uint64_t, std::unique_ptr<ManagedTcpResources>> held_teardowns;
+static std::unordered_map<uint64_t, std::unique_ptr<ManagedTcpResources>> retiring_tcp;
+static std::unordered_map<uint32_t, ManagedFlowRule> managed_rules;
 
 static void submit_rss_job(RssJob job)
 {
+    ++mgmt_outstanding;
     {
         std::lock_guard<std::mutex> lock(rss_mutex);
         rss_jobs.push_back(std::move(job));
     }
     rss_notify.notify_one();
 }
+
+static void poll_rss_results();
+static void retire_app(app_ctx *app);
+static void submit_retiring_tcp(app_ctx &app);
 
 static std::vector<RssResult> take_rss_results()
 {
@@ -425,6 +477,116 @@ static void destroy_rss_context(struct app_ctx *actx)
 {
     if (actx->rss_ctx_id && actx->proto == IPPROTO_TCP && delete_tcp_rss_context(actx->rss_ctx_id))
         actx->rss_ctx_id = 0;
+}
+
+static bool delete_flow_rule(int id)
+{
+    std::string output;
+    return exec_cmd("ethtool -U " + etran_nic->_if_name + " delete " + std::to_string(id), output, true);
+}
+
+static uint32_t flow_rule_key(uint16_t local, uint16_t remote)
+{
+    return remote ? (0x10000U | remote) : local;
+}
+
+static auto &rule_routes(uint32_t key)
+{
+    return (key & 0x10000U) ? sport_to_actx : dport_to_actx;
+}
+
+static void queue_flow_rule(app_ctx &app, FlowRuleWork work)
+{
+    ++app.pending_rule_io;
+    RssJob job{app.generation, {}};
+    job.rule = work;
+    submit_rss_job(std::move(job));
+}
+
+int record_tcp_port(app_ctx &app, uint16_t local, uint16_t remote, uint64_t cookie)
+{
+    const auto key = flow_rule_key(local, remote);
+    auto &routes = rule_routes(key);
+    auto route = routes.find(static_cast<uint16_t>(key));
+    if (route != routes.end() && route->second != &app)
+        return -EADDRINUSE;
+
+    auto [it, inserted] = managed_rules.try_emplace(key, ManagedFlowRule{&app, RuleState::Adding, 0, -1, {}, {}});
+    auto &rule = it->second;
+    if (rule.owner != &app)
+        return -EADDRINUSE;
+    if (rule.state != RuleState::Adding && rule.state != RuleState::Installed)
+        return -EAGAIN;
+
+    ++rule.users;
+    ++app.tcp_port_refs[local];
+    app.ports.insert(local);
+    if (rule.state == RuleState::Installed)
+        return 0;
+    rule.waiters.push_back(cookie);
+    if (inserted)
+        queue_flow_rule(app, {key, app.rss_ctx_id});
+    return -EINPROGRESS;
+}
+
+static void release_rule_port(app_ctx &app, uint16_t port)
+{
+    if (app.ports.erase(port))
+        free_port(port);
+}
+
+static void reclaim_unused_flow_rule(uint32_t key)
+{
+    auto it = managed_rules.find(key);
+    if (it == managed_rules.end())
+        return;
+    auto &rule = it->second;
+    if (rule.users || rule.owner->uds_state == UdsState::WaitTeardown)
+        return;
+    if (rule.state == RuleState::Installed) {
+        rule_routes(key).erase(static_cast<uint16_t>(key));
+        rule.state = RuleState::Deleting;
+        queue_flow_rule(*rule.owner, {key, rule.owner->rss_ctx_id, rule.id});
+    } else if (rule.state == RuleState::AddFailed) {
+        for (auto port : rule.held_ports)
+            release_rule_port(*rule.owner, port);
+        managed_rules.erase(it);
+    }
+}
+
+void unrecord_tcp_port(app_ctx &app, uint16_t local, uint16_t remote)
+{
+    const auto key = flow_rule_key(local, remote);
+    auto &rule = managed_rules.at(key);
+    auto lease = app.tcp_port_refs.find(local);
+    assert(rule.owner == &app && rule.users && lease != app.tcp_port_refs.end());
+    --rule.users;
+    if (--lease->second == 0) {
+        app.tcp_port_refs.erase(lease);
+        if (!rule.users || app.uds_state == UdsState::WaitTeardown)
+            rule.held_ports.push_back(local);
+        else
+            release_rule_port(app, local);
+    }
+    reclaim_unused_flow_rule(key);
+}
+
+static int install_flow_rule(const FlowRuleWork &rule)
+{
+    const char *field = rule.key & 0x10000U ? "src-port " : "dst-port ";
+    std::string output;
+    if (!exec_cmd("ethtool -U " + etran_nic->_if_name + " flow-type tcp4 " + field +
+                  std::to_string(static_cast<uint16_t>(rule.key)) + " context " + std::to_string(rule.rss),
+                  output, true))
+        return -EIO;
+    constexpr char prefix[] = "Added rule with ID ";
+    const auto pos = output.find(prefix);
+    if (pos == std::string::npos)
+        return -EIO;
+    const char *start = output.c_str() + pos + sizeof(prefix) - 1;
+    char *end;
+    const long id = strtol(start, &end, 10);
+    return end == start || id < 0 || id > INT_MAX ? -EIO : static_cast<int>(id);
 }
 
 #ifdef ALLOCATION
@@ -888,7 +1050,7 @@ class MigrationExecutor {
         const int target = rollback ? move.src : move.dst;
         const int expected = write && !rollback ? move.src : -1;
         move.pending_io = true;
-        submit_rss_job({move.app->generation, 0, {},
+        submit_rss_job({move.app->generation, {},
                         IrqWork{move.token, move.qid, target, expected, write, !move.initially_idle}});
     }
 
@@ -1023,6 +1185,8 @@ public:
         move.next_sample = Clock::now() + std::chrono::milliseconds(5);
         if (io.operation.write) {
             move.base = io.sample;
+            if (io.attempted)
+                move.began = io.write_started;
             if (!result.error)
                 return;
             if (rollback) {
@@ -1290,9 +1454,125 @@ static int create_rss_context(struct app_ctx *actx, const std::vector<unsigned i
 #endif
 }
 
-static RssResult execute_rss_job(const RssJob &job)
+static int dispose_managed_tcp(ManagedTcpResources &res)
 {
-    RssResult result{job.generation, job.remove_context, 0, 0};
+    auto &rules = res.rule_ids;
+    rules.erase(std::remove_if(rules.begin(), rules.end(), delete_flow_rule), rules.end());
+    if (!rules.empty())
+        return -EIO;
+    if (res.rss_context && !delete_tcp_rss_context(res.rss_context))
+        return -EIO;
+    res.rss_context = 0;
+
+    for (auto *info : res.controls) {
+        if (info) {
+            xsk_socket__delete(info->xsk);
+            free(info);
+        }
+    }
+    res.controls.clear();
+    for (int fd : res.data_fds)
+        close(fd);
+    res.data_fds.clear();
+    if (res.bpw.bp && res.bpw.bp->umem) {
+        if (const int error = xsk_umem__delete(res.bpw.bp->umem))
+            return error;
+        res.bpw.bp->umem = nullptr;
+    }
+    bp_free(&res.bpw);
+    res.bpw = {};
+    for (auto *lrpc : res.lrpcs)
+        shm_wrapper_destroy(lrpc);
+    res.lrpcs.clear();
+    for (int fd : res.event_fds)
+        close(fd);
+    res.event_fds.clear();
+    return 0;
+}
+
+static int prepare_managed_tcp(const RssJob &job, ManagedTcpResources &res)
+{
+    const auto &prep = *job.prepare;
+    if (bp_init(&res.bpw, prep.pid, SHM_BP_PREFIX, SHM_UMEM_PREFIX))
+        return -ENOMEM;
+    for (const auto &[qid, cpu] : job.placement) {
+        auto *xsk = xsk_configure_socket_for_queue(&res.bpw, qid, IPPROTO_TCP);
+        if (!xsk)
+            return -EIO;
+        res.controls.push_back(xsk);
+        struct xdp_options options{};
+        socklen_t size = sizeof(options);
+        if (getsockopt(xsk_socket__fd(xsk->xsk), SOL_XDP, XDP_OPTIONS, &options, &size))
+            return -errno;
+        res.umem_id = options.umem_id;
+    }
+    const auto count = prep.threads * job.placement.size();
+    const auto &name = etran_nic->_if_name;
+    for (size_t i = 0; i < count; ++i) {
+        const int fd = socket(AF_XDP, SOCK_RAW | SOCK_CLOEXEC, 0);
+        if (fd < 0)
+            return -errno;
+        res.data_fds.push_back(fd);
+        if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, name.c_str(), name.size()))
+            return -errno;
+        if (prep.busy_poll)
+            apply_socket_busy_poll(fd);
+    }
+    for (unsigned int slot = 0; slot < prep.threads; ++slot) {
+        const int event = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (event < 0)
+            return -errno;
+        res.event_fds.push_back(event);
+        const auto name = SHM_LRPC_PREFIX + std::to_string(prep.pid) + '_' + std::to_string(slot);
+        auto *lrpc = shm_wrapper_create(name, lrpc_control_offset + sizeof(worker_sched_ctrl));
+        if (!lrpc)
+            return -ENOMEM;
+        res.lrpcs.push_back(lrpc);
+    }
+    std::vector<unsigned int> qids;
+    for (const auto &[qid, cpu] : job.placement) {
+        if (cpu >= 0)
+            if (const int error = etran_nic->set_queue_cpu(qid, cpu))
+                return error;
+        qids.push_back(qid);
+    }
+    const int context = create_tcp_rss_context(qids);
+    if (context < 0)
+        return context;
+    res.rss_context = context;
+    return 0;
+}
+
+static RssResult execute_rss_job(RssJob job)
+{
+    RssResult result{job.generation};
+    if (job.rule) {
+        result.rule = job.rule;
+        if (job.rule->id >= 0)
+            result.error = delete_flow_rule(job.rule->id) ? 0 : -EIO;
+        else {
+            const int id = install_flow_rule(*job.rule);
+            if (id < 0)
+                result.error = id;
+            else
+                result.context = id;
+        }
+        return result;
+    }
+    if (job.teardown) {
+        result.teardown = true;
+        result.error = dispose_managed_tcp(*job.teardown);
+        if (result.error)
+            result.resources = std::move(job.teardown);
+        return result;
+    }
+    if (job.prepare) {
+        result.resources = std::make_unique<ManagedTcpResources>();
+        result.error = prepare_managed_tcp(job, *result.resources);
+        if (result.error && !dispose_managed_tcp(*result.resources))
+            result.resources.reset();
+        return result;
+    }
     if (job.irq) {
         const auto &op = *job.irq;
         result.irq = IrqResult{op, {}};
@@ -1306,25 +1586,11 @@ static RssResult execute_rss_job(const RssJob &job)
             return result;
         }
         io.attempted = true;
+        io.write_started = std::chrono::steady_clock::now();
         result.error = etran_nic->set_queue_cpu(op.qid, op.target);
         return result;
     }
-    if (job.remove_context) {
-        result.error = delete_tcp_rss_context(job.remove_context) ? 0 : -EIO;
-        return result;
-    }
-
-    std::vector<unsigned int> qids;
-    for (const auto &[qid, cpu] : job.placement) {
-        if (cpu >= 0 && (result.error = etran_nic->set_queue_cpu(qid, cpu)))
-            return result;
-        qids.push_back(qid);
-    }
-    const int id = create_tcp_rss_context(qids);
-    if (id < 0)
-        result.error = id;
-    else
-        result.context = id;
+    result.error = -EINVAL;
     return result;
 }
 
@@ -1352,9 +1618,11 @@ static void run_rss_worker()
         auto job = std::move(rss_jobs.front());
         rss_jobs.pop_front();
         lock.unlock();
-        const auto result = execute_rss_job(job);
+        auto result = execute_rss_job(std::move(job));
         lock.lock();
-        rss_results.push_back(result);
+        rss_results.push_back(std::move(result));
+        lock.unlock();
+        rss_notify.notify_all();
     }
 }
 
@@ -1431,6 +1699,90 @@ static void return_resources(app_ctx &app)
     if (!app.use_shared_queues)
         for (unsigned int i = 0; i < app.nr_nic_queues; ++i)
             etran_nic->_free_exclusive_qids.push_back(app.nic_qid[i]);
+    ++resource_epoch;
+}
+
+static void submit_teardown(app_ctx &app, std::unique_ptr<ManagedTcpResources> resources)
+{
+    app.uds_state = UdsState::WaitTeardown;
+    RssJob job{app.generation, {}};
+    job.teardown = std::move(resources);
+    submit_rss_job(std::move(job));
+}
+
+static void submit_retiring_tcp(app_ctx &app)
+{
+    auto it = retiring_tcp.find(app.generation);
+    if (it == retiring_tcp.end() || app.pending_rule_io)
+        return;
+    for (const auto &[key, rule] : managed_rules) {
+        if (rule.owner != &app)
+            continue;
+        if (rule.id >= 0)
+            it->second->rule_ids.push_back(rule.id);
+        rule_routes(key).erase(static_cast<uint16_t>(key));
+    }
+    auto resources = std::move(it->second);
+    retiring_tcp.erase(it);
+    submit_teardown(app, std::move(resources));
+}
+
+static void retire_managed_tcp(app_ctx &app)
+{
+#ifdef ALLOCATION
+    migration_executor.cancel(app);
+#endif
+    scheduler_unregister_workers(app.generation);
+    app.uds_state = UdsState::WaitTeardown;
+    auto resources = std::make_unique<ManagedTcpResources>();
+    resources->rss_context = app.rss_ctx_id;
+
+    // Keep flow operations on the owner until their rule IDs can be transferred.
+    free_tcp_resources(&app);
+    for (const auto &rule : app.flow_director_rules) {
+        (rule.source ? sport_to_actx : dport_to_actx).erase(rule.port);
+        resources->rule_ids.push_back(rule.id);
+    }
+    app.flow_director_rules.clear();
+
+    for (unsigned int i = 0; i < app.nr_nic_queues; ++i) {
+        const auto qid = app.nic_qid[i];
+#ifdef ALLOCATION
+        irq_owner_tokens[qid].store(0, std::memory_order_release);
+#endif
+        scheduler_unregister_queue(qid);
+        auto &queue = etran_nic->_nic_queues[qid];
+        auto *xsk = queue.xsk_info;
+        const int fd = xsk_socket__fd(xsk->xsk);
+        epoll_ctl(xsk_epfd, EPOLL_CTL_DEL, fd, nullptr);
+        unregister_xsk_map(fd, queue.xsk_map_key, app.proto);
+        unregister_slow_path_map(qid, app.proto);
+        resources->controls.push_back(xsk);
+        queue.xsk_info = nullptr;
+        queue.bpw = nullptr;
+        queue.xsk_map_key = 0;
+        auto &owners = queue.actxs;
+        owners.erase(std::remove(owners.begin(), owners.end(), &app), owners.end());
+    }
+    for (unsigned int i = 0; i < app.nr_app_threads; ++i) {
+        auto &worker = app.tctx[i];
+        for (unsigned int j = 0; j < app.nr_nic_queues; ++j) {
+            const int fd = worker.txrx_xsk_fd[j];
+            unregister_xsk_map(fd, worker.txrx_xsk_map_key[j], app.proto);
+            resources->data_fds.push_back(fd);
+        }
+        resources->lrpcs.push_back(std::exchange(worker.lrpc, nullptr));
+        resources->event_fds.push_back(std::exchange(worker.evfd, -1));
+    }
+    bpf_map_delete_elem(etran_entrance->_umem_id_tran_map_fd, &app.umem_id);
+    resources->bpw = std::exchange(app.bpw, {});
+    app.done = false;
+    app.resources_ready = false;
+    for (const auto &[key, rule] : managed_rules)
+        if (rule.owner == &app)
+            rule_routes(key).erase(static_cast<uint16_t>(key));
+    retiring_tcp.emplace(app.generation, std::move(resources));
+    submit_retiring_tcp(app);
 }
 
 static bool collect_cc_jitter()
@@ -1454,7 +1806,7 @@ static uint64_t report_slow_control_step(const char *operation, const app_ctx &a
     return end;
 }
 
-static void free_app_resources(struct app_ctx *actx, bool return_queues)
+static void free_app_resources(struct app_ctx *actx)
 {
     auto stage = collect_cc_jitter() ? get_cycles() : 0;
     if (actx->proto == IPPROTO_TCP)
@@ -1479,8 +1831,7 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
         free_homa_resources(actx);
     }
 
-    if (return_queues)
-        destroy_rss_context(actx);
+    destroy_rss_context(actx);
     stage = report_slow_control_step("flow_cleanup", *actx, stage);
 
     for (unsigned int i = 0; i < actx->nr_nic_queues; i++)
@@ -1530,8 +1881,7 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
         shm_wrapper_destroy(actx->tctx[i].lrpc);
         close(actx->tctx[i].evfd);
     }
-    if (return_queues)
-        return_resources(*actx);
+    return_resources(*actx);
     actx->done = false;
     actx->resources_ready = false;
     report_slow_control_step("socket_cleanup", *actx, stage);
@@ -1539,52 +1889,45 @@ static void free_app_resources(struct app_ctx *actx, bool return_queues)
 
 static void destroy_all_apps(void)
 {
-#ifdef ALLOCATION
-    for (auto *app : active_apps.apps)
-        migration_executor.cancel(*app);
-#endif
-    stop_rss_worker();
-    for (const auto &result : take_rss_results()) {
-#ifdef ALLOCATION
-        if (result.irq) {
-            migration_executor.on_irq_result(result);
-            continue;
-        }
-#endif
-        for (auto *app : active_apps.apps) {
-            if (app->generation != result.generation)
-                continue;
-            if (!result.remove_context)
-                app->rss_ctx_id = result.context;
-            else if (!result.error)
-                app->rss_ctx_id = 0;
-            break;
-        }
-    }
-    if (active_apps.apps.empty()) {
-        return;
-    }
-    // Notify all apps to exit
     bool had_live_apps = false;
-    for (auto *app : active_apps.apps) {
+    const auto apps = active_apps.apps;
+    for (auto *app : apps) {
         if (app->fd >= 0 && app->done) {
             kill_app(app->pid);
             had_live_apps = true;
         }
+        if (app->fd >= 0) {
+            close(app->fd);
+            app->fd = -1;
+        }
     }
     if (had_live_apps)
         sleep(1);
-
-    // Free all resources
-    for (auto *app : active_apps.apps) {
-        if (app->resources_ready || app->done)
-            free_app_resources(app);
-        else
-            destroy_rss_context(app);
-        if (app->fd >= 0)
-            close(app->fd);
-        delete app;
+    for (auto *app : apps)
+        retire_app(app);
+    while (mgmt_outstanding) {
+        {
+            std::unique_lock<std::mutex> lock(rss_mutex);
+            rss_notify.wait(lock, [] { return !rss_results.empty(); });
+        }
+        poll_rss_results();
     }
+    for (auto it = held_teardowns.begin(); it != held_teardowns.end(); ++it) {
+        RssJob job{it->first, {}};
+        job.teardown = std::move(it->second);
+        submit_rss_job(std::move(job));
+    }
+    held_teardowns.clear();
+    while (mgmt_outstanding) {
+        {
+            std::unique_lock<std::mutex> lock(rss_mutex);
+            rss_notify.wait(lock, [] { return !rss_results.empty(); });
+        }
+        poll_rss_results();
+    }
+    stop_rss_worker();
+    for (auto *app : active_apps.apps)
+        delete app;
     active_apps.apps.clear();
     active_apps.nr_app = 0;
 }
@@ -1599,9 +1942,11 @@ static void erase_app(app_ctx *app)
 
 static void retire_app(app_ctx *app)
 {
-    if (app->rss_ctx_id && !app->use_shared_queues) {
-        free_app_resources(app, false);
-        submit_rss_job({app->generation, app->rss_ctx_id, {}});
+    if (app->managed_tcp) {
+        if (app->resources_ready)
+            retire_managed_tcp(*app);
+        else if (app->uds_state != UdsState::WaitMgmt && app->uds_state != UdsState::WaitTeardown)
+            erase_app(app);
         return;
     }
     if (app->resources_ready || app->done)
@@ -1616,7 +1961,7 @@ static void destroy_app(int fd)
         app->fd = -1;
         if (app->done)
             kill_app(app->pid);
-        if (app->uds_state != UdsState::WaitMgmt)
+        if (app->uds_state != UdsState::WaitMgmt && app->uds_state != UdsState::WaitTeardown)
             retire_app(app);
     }
 }
@@ -1741,13 +2086,25 @@ static int register_slow_path_map(unsigned int qid, int xsk_map_key, int proto)
     return 0;
 }
 
+static int attach_lrpc_channel(app_ctx &app, unsigned int i)
+{
+    auto &worker = app.tctx[i];
+    auto *kernel_head = static_cast<char *>(worker.lrpc->addr);
+    auto *app_head = kernel_head + sizeof(head_wb);
+    auto *channel_1 = app_head + sizeof(head_wb);
+    auto *channel_2 = channel_1 + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE;
+    worker.sched_ctrl = new (kernel_head + lrpc_control_offset) worker_sched_ctrl{};
+    if (lrpc_init_out(&worker.kernel_out, reinterpret_cast<lrpc_msg *>(channel_1), LRPC_CHANNEL_SIZE,
+                      reinterpret_cast<uint32_t *>(app_head)) ||
+        lrpc_init_in(&worker.kernel_in, reinterpret_cast<lrpc_msg *>(channel_2), LRPC_CHANNEL_SIZE,
+                     reinterpret_cast<uint32_t *>(kernel_head)))
+        return -EIO;
+    worker.actx = &app;
+    return 0;
+}
+
 static inline int init_lrpc_channels(struct app_ctx *actx, const char *lrpc_prefix)
 {
-    std::string shm_lrpc_name;
-    uint64_t lrpc_size;
-    char *k_recv_head_wb, *app_recv_head_wb;
-    char *channel_1, *channel_2;
-
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
     {
         actx->tctx[i].evfd = eventfd(0, EFD_NONBLOCK);
@@ -1760,44 +2117,119 @@ static inline int init_lrpc_channels(struct app_ctx *actx, const char *lrpc_pref
 
     for (unsigned int i = 0; i < actx->nr_app_threads; i++)
     {
-        // shm_lrpc_name = "LRPC_" + std::to_string(actx->pid) + "_" + std::to_string(i);
-        shm_lrpc_name = lrpc_prefix + std::to_string(actx->pid) + "_" + std::to_string(i);
-        lrpc_size = (sizeof(struct head_wb) + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE) * 2;
-        static_assert(sizeof(head_wb) == 64 && sizeof(lrpc_msg) == 64, "scheduler control alignment");
-        actx->tctx[i].lrpc = shm_wrapper_create(shm_lrpc_name, lrpc_size + sizeof(worker_sched_ctrl));
+        const auto name = lrpc_prefix + std::to_string(actx->pid) + "_" + std::to_string(i);
+        actx->tctx[i].lrpc = shm_wrapper_create(name, lrpc_control_offset + sizeof(worker_sched_ctrl));
         if (!actx->tctx[i].lrpc)
         {
             fprintf(stderr, "shm_wrapper_create failed\n");
             return -ENOMEM;
         }
 
-        k_recv_head_wb = (char *)actx->tctx[i].lrpc->addr;
-        app_recv_head_wb = k_recv_head_wb + sizeof(struct head_wb);
-
-        channel_1 = app_recv_head_wb + sizeof(struct head_wb);
-        channel_2 = channel_1 + sizeof(lrpc_msg) * LRPC_CHANNEL_SIZE;
-        actx->tctx[i].sched_ctrl = new (k_recv_head_wb + lrpc_size) worker_sched_ctrl{};
-
-        if (lrpc_init_out(&actx->tctx[i].kernel_out, (lrpc_msg *)channel_1, LRPC_CHANNEL_SIZE,
-                          (uint32_t *)app_recv_head_wb))
-        {
-            goto err;
-        }
-
-        if (lrpc_init_in(&actx->tctx[i].kernel_in, (lrpc_msg *)channel_2, LRPC_CHANNEL_SIZE,
-                         (uint32_t *)k_recv_head_wb))
-        {
-            goto err;
-        }
-
-        actx->tctx[i].actx = actx;
+        if (int error = attach_lrpc_channel(*actx, i))
+            return error;
     }
 
     return 0;
 
-err:
-    // The registration owner closes even partially initialized channels.
-    return -EIO;
+}
+
+static int stage_tcp_xsk_keys(size_t control_count, size_t data_count)
+{
+    auto &keys = etran_nic->_available_xsk_keys;
+    if (control_count + data_count > keys.size())
+        return -ENOSPC;
+    const auto wide = std::stable_partition(keys.begin(), keys.end(), [](int key) { return key <= UINT8_MAX; });
+    if (wide < keys.begin() + data_count)
+        return -ENOSPC;
+    if (wide < keys.begin() + control_count + data_count)
+        std::rotate(keys.begin(), wide, keys.begin() + control_count + data_count);
+    return 0;
+}
+
+static int publish_managed_tcp(app_ctx &app, const ManagedTcpResources &res)
+{
+    const unsigned int queues = app.nr_nic_queues;
+    if (int error = stage_tcp_xsk_keys(queues, res.data_fds.size()))
+        return error;
+    app.bpw = res.bpw;
+    app.umem_id = res.umem_id;
+    app.rss_ctx_id = res.rss_context;
+    if (thread_bcache_create(&app.bpw, &app.iobuffer))
+        return -ENOMEM;
+    for (unsigned int i = 0; i < app.nr_app_threads; ++i) {
+        app.tctx[i].lrpc = res.lrpcs[i];
+        app.tctx[i].evfd = res.event_fds[i];
+        if (int error = attach_lrpc_channel(app, i))
+            return error;
+    }
+
+    int transport = 0;
+    if (bpf_map_update_elem(etran_entrance->_umem_id_tran_map_fd, &app.umem_id, &transport, BPF_ANY))
+        return -errno;
+
+    auto &keys = etran_nic->_available_xsk_keys;
+    unsigned int controls = 0, data = 0, polled = 0;
+    int error = 0;
+    for (unsigned int i = 0; i < queues; ++i) {
+        const auto qid = app.nic_qid[i];
+        const auto fd = xsk_socket__fd(res.controls[i]->xsk);
+        const auto key = keys.front();
+        if ((error = register_xsk_map(fd, key, IPPROTO_TCP)))
+            break;
+        ++controls;
+        keys.erase(keys.begin());
+        app.umem_fd[i] = fd;
+        etran_nic->_nic_queues[qid].xsk_map_key = key;
+        if ((error = register_slow_path_map(qid, key, IPPROTO_TCP)))
+            break;
+        struct epoll_event event{};
+        event.events = EPOLLIN | EPOLLERR;
+        event.data.fd = fd;
+        if (epoll_ctl(xsk_epfd, EPOLL_CTL_ADD, fd, &event) < 0) {
+            error = -errno;
+            break;
+        }
+        ++polled;
+    }
+
+    for (size_t i = 0; !error && i < res.data_fds.size(); ++i) {
+        const int key = keys.front();
+        const int fd = res.data_fds[i];
+        if ((error = register_xsk_map(fd, key, IPPROTO_TCP)))
+            break;
+        auto &worker = app.tctx[i / queues];
+        worker.txrx_xsk_fd[i % queues] = fd;
+        worker.txrx_xsk_map_key[i % queues] = key;
+        ++data;
+        keys.erase(keys.begin());
+    }
+
+    if (error) {
+        for (unsigned int i = 0; i < data; ++i)
+            unregister_xsk_map(res.data_fds[i], app.tctx[i / queues].txrx_xsk_map_key[i % queues], IPPROTO_TCP);
+        for (unsigned int i = 0; i < controls; ++i) {
+            const auto qid = app.nic_qid[i];
+            auto &queue = etran_nic->_nic_queues[qid];
+            if (i < polled)
+                epoll_ctl(xsk_epfd, EPOLL_CTL_DEL, app.umem_fd[i], nullptr);
+            unregister_slow_path_map(qid, IPPROTO_TCP);
+            unregister_xsk_map(app.umem_fd[i], queue.xsk_map_key, IPPROTO_TCP);
+            queue.xsk_map_key = 0;
+        }
+        bpf_map_delete_elem(etran_entrance->_umem_id_tran_map_fd, &app.umem_id);
+        return error;
+    }
+
+    for (unsigned int i = 0; i < queues; ++i) {
+        const auto qid = app.nic_qid[i];
+        auto &queue = etran_nic->_nic_queues[qid];
+        app.qid2idx[qid] = i;
+        queue.bpw = &app.bpw;
+        queue.xsk_info = res.controls[i];
+        queue.actxs.push_back(&app);
+    }
+    app.resources_ready = true;
+    return 0;
 }
 
 static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, std::vector<unsigned int> &qids) {
@@ -1824,6 +2256,16 @@ static int try_allocate_queues(unsigned int nr_queues, queue_usage_hint hint, st
     if (hint == Q_EXCLUSIVE)
         free.resize(free.size() - nr_queues);
     return 0;
+}
+
+static bool tcp_app_is_retiring(const app_ctx &app)
+{
+    if (!app.managed_tcp || !app.nr_nic_queues)
+        return false;
+    if (app.uds_state == UdsState::WaitTeardown || app.fd < 0)
+        return true;
+    pollfd socket{app.fd, POLLRDHUP, 0};
+    return poll(&socket, 1, 0) > 0 && (socket.revents & (POLLRDHUP | POLLHUP | POLLERR));
 }
 
 // step1: create a buffer pool and UMEM
@@ -1889,29 +2331,22 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (!actx)
         return -ENOENT;
 
+    if (req.proto == IPPROTO_TCP && req.queue_usage == Q_EXCLUSIVE &&
+        std::any_of(active_apps.apps.begin(), active_apps.apps.end(), [&](const auto *app) {
+            return app != actx && app->pid == actx->pid && (app->managed_tcp || app->done);
+        }))
+        return -EBUSY;
+
     if (req.proto == IPPROTO_TCP) {
-        // TCP's per-connection map encodes the data XSK keys as u8.
-        auto wide = std::stable_partition(xsk_keys.begin(), xsk_keys.end(),
-                                          [](int key) { return key <= UINT8_MAX; });
-        if (wide < xsk_keys.begin() + data_keys) {
-            fprintf(stderr, "Not enough TCP data XSK keys in the 8-bit range\n");
-            return -ENOSPC;
-        }
-        // Slow-path keys can use the remainder of the XSK map.
-        if (wide < xsk_keys.begin() + total_keys)
-            std::rotate(xsk_keys.begin(), wide, xsk_keys.begin() + total_keys);
+        if (const int rc = stage_tcp_xsk_keys(req.nr_nic_queues, data_keys))
+            return rc;
     }
 
     if (int rc = try_allocate_queues(req.nr_nic_queues, req.queue_usage, qids)) {
         if (rc == -ENOSPC && req.proto == IPPROTO_TCP && req.queue_usage == Q_EXCLUSIVE) {
             size_t reclaiming = etran_nic->_free_exclusive_qids.size();
             for (const auto *other : active_apps.apps) {
-                if (other->proto != IPPROTO_TCP || other->use_shared_queues ||
-                    (!other->resources_ready && !other->rss_ctx_id))
-                    continue;
-                pollfd socket{other->fd, POLLRDHUP, 0};
-                if (socket.fd < 0 || (poll(&socket, 1, 0) > 0 &&
-                                      (socket.revents & (POLLRDHUP | POLLHUP | POLLERR))))
+                if (other != actx && tcp_app_is_retiring(*other))
                     reclaiming += other->nr_nic_queues;
             }
             if (reclaiming >= req.nr_nic_queues)
@@ -1937,10 +2372,30 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
         if (int rc = bind_rss_core(actx, qids, true)) {
             return_resources(*actx);
+            if (rc == -ENOSPC && std::any_of(active_apps.apps.begin(), active_apps.apps.end(),
+                [&](const auto *app) { return app != actx && tcp_app_is_retiring(*app); }))
+                return -EAGAIN;
             return rc;
         }
     }
 #endif
+
+    if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
+        RssJob job{actx->generation, {}};
+        job.prepare = PrepRequest{actx->pid, actx->nr_app_threads, etran_nic->_socket_busy_poll};
+#ifdef ALLOCATION
+        auto cpu = actx->usedCores.begin();
+        for (auto qid : qids)
+            job.placement.emplace_back(qid, *cpu++);
+#else
+        for (auto qid : qids)
+            job.placement.emplace_back(qid, -1);
+#endif
+        actx->managed_tcp = true;
+        actx->uds_state = UdsState::WaitMgmt;
+        submit_rss_job(std::move(job));
+        return -EINPROGRESS;
+    }
 
     if (int rc = init_lrpc_channels(actx, SHM_LRPC_PREFIX))
     {
@@ -2084,20 +2539,6 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
     report_slow_control_step("data_xsk_and_maps", *actx, stage);
 
     actx->resources_ready = true;
-    if (actx->proto == IPPROTO_TCP && !actx->use_shared_queues) {
-        RssJob job{actx->generation, 0, {}};
-#ifdef ALLOCATION
-        auto cpu = actx->usedCores.begin();
-        for (auto qid : qids)
-            job.placement.emplace_back(qid, *cpu++);
-#else
-        for (auto qid : qids)
-            job.placement.emplace_back(qid, -1);
-#endif
-        actx->uds_state = UdsState::WaitMgmt;
-        submit_rss_job(std::move(job));
-        return -EINPROGRESS;
-    }
     if (int error = create_rss_context(actx, qids)) {
         free_app_resources(actx);
         return error;
@@ -2221,7 +2662,8 @@ static int poll_uds_reply(app_ctx &app)
 static bool uds_wants_write(UdsState state)
 {
     return state != UdsState::RecvRequest && state != UdsState::RecvCpu &&
-           state != UdsState::Ready && state != UdsState::WaitMgmt && state != UdsState::WaitQueue;
+           state != UdsState::Ready && state != UdsState::WaitMgmt && state != UdsState::WaitTeardown &&
+           state != UdsState::WaitQueue;
 }
 
 static void start_uds_registration(app_ctx &app)
@@ -2231,8 +2673,9 @@ static void start_uds_registration(app_ctx &app)
         return;
     if (error == -EAGAIN) {
         if (app.uds_state != UdsState::WaitQueue)
-            app.uds_queue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+            app.uds_queue_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         app.uds_state = UdsState::WaitQueue;
+        app.uds_resource_epoch = resource_epoch;
     } else if (error) {
         prepare_uds_response(app, UdsState::SendError, REG_FAIL, error);
     } else {
@@ -2242,7 +2685,8 @@ static void start_uds_registration(app_ctx &app)
 
 static int poll_uds_request(app_ctx &app)
 {
-    if (app.uds_state == UdsState::WaitMgmt || app.uds_state == UdsState::WaitQueue)
+    if (app.uds_state == UdsState::WaitMgmt || app.uds_state == UdsState::WaitQueue ||
+        app.uds_state == UdsState::WaitTeardown)
         return -EPROTO;
     if (app.uds_state == UdsState::RecvCpu) {
         int rc = poll_uds_frame(app, &app.uds_requested_cpu, sizeof(app.uds_requested_cpu), false);
@@ -2280,9 +2724,45 @@ static int update_uds_interest(const app_ctx &app, bool was_writing)
     return 0;
 }
 
+static void complete_flow_rule(app_ctx &app, const RssResult &result)
+{
+    const auto work = *result.rule;
+    auto it = managed_rules.find(work.key);
+    assert(app.pending_rule_io && it != managed_rules.end() && it->second.owner == &app);
+    --app.pending_rule_io;
+    auto &rule = it->second;
+    const auto port = static_cast<uint16_t>(work.key);
+    if (work.id >= 0) {
+        if (result.error) {
+            rule.state = RuleState::DeleteFailed;
+            fprintf(stderr, "Flow rule delete failed id=%d error=%d\n", rule.id, result.error);
+        } else if (app.uds_state == UdsState::WaitTeardown) {
+            rule.id = -1;
+        } else {
+            for (auto local : rule.held_ports)
+                release_rule_port(app, local);
+            managed_rules.erase(it);
+        }
+    } else {
+        rule.state = result.error ? RuleState::AddFailed : RuleState::Installed;
+        if (!result.error)
+            rule.id = result.context;
+        if (app.uds_state != UdsState::WaitTeardown) {
+            if (!result.error && rule.users)
+                rule_routes(work.key)[port] = &app;
+            auto waiters = std::move(rule.waiters);
+            for (auto cookie : waiters)
+                tcp_flow_rule_ready(cookie, result.error);
+            reclaim_unused_flow_rule(work.key);
+        }
+    }
+    submit_retiring_tcp(app);
+}
+
 static void poll_rss_results()
 {
-    for (const auto &result : take_rss_results()) {
+    for (auto &result : take_rss_results()) {
+        --mgmt_outstanding;
 #ifdef ALLOCATION
         if (result.irq) {
             migration_executor.on_irq_result(result);
@@ -2295,31 +2775,68 @@ static void poll_rss_results()
         });
         assert(it != apps.end());
         auto *app = *it;
-        if (result.remove_context) {
+        if (result.rule) {
+            complete_flow_rule(*app, result);
+            continue;
+        }
+        if (result.teardown) {
             if (result.error) {
-                fprintf(stderr, "RSS cleanup failed app_gen=%llu rss_context=%d, holding CPU and QID reservations\n",
-                        static_cast<unsigned long long>(app->generation), result.remove_context);
+                fprintf(stderr, "TCP teardown failed app_gen=%llu error=%d, holding reservations\n",
+                        static_cast<unsigned long long>(app->generation), result.error);
+                held_teardowns.emplace(app->generation, std::move(result.resources));
+                if (app->fd >= 0) {
+                    close(app->fd);
+                    app->fd = -1;
+                }
                 continue;
             }
             app->rss_ctx_id = 0;
+            app->managed_tcp = false;
+            for (auto rule = managed_rules.begin(); rule != managed_rules.end();) {
+                if (rule->second.owner == app)
+                    rule = managed_rules.erase(rule);
+                else
+                    ++rule;
+            }
+            for (auto port : app->ports)
+                free_port(port);
+            app->ports.clear();
+            app->tcp_port_refs.clear();
             return_resources(*app);
-            erase_app(app);
+            if (app->fd < 0) {
+                erase_app(app);
+                continue;
+            }
+            prepare_uds_response(*app, UdsState::SendError, REG_FAIL, app->registration_error);
+            if (update_uds_interest(*app, false))
+                destroy_app(app->fd);
             continue;
         }
-        app->rss_ctx_id = result.context;
-        if (app->fd < 0) {
-            retire_app(app);
+        if (app->managed_tcp) {
+            int error = result.error;
+            if (!error && app->fd >= 0)
+                error = publish_managed_tcp(*app, *result.resources);
+            if (!error && app->fd >= 0) {
+                finish_registration(*app);
+                prepare_uds_response(*app, UdsState::SendXsk, REG_XSK_FD);
+            } else if (result.resources) {
+                app->registration_error = error;
+                submit_teardown(*app, std::move(result.resources));
+                continue;
+            } else {
+                app->managed_tcp = false;
+                return_resources(*app);
+                if (app->fd < 0) {
+                    erase_app(app);
+                    continue;
+                }
+                prepare_uds_response(*app, UdsState::SendError, REG_FAIL, error);
+            }
+            if (update_uds_interest(*app, false))
+                destroy_app(app->fd);
             continue;
         }
-        if (result.error) {
-            free_app_resources(app);
-            prepare_uds_response(*app, UdsState::SendError, REG_FAIL, result.error);
-        } else {
-            finish_registration(*app);
-            prepare_uds_response(*app, UdsState::SendXsk, REG_XSK_FD);
-        }
-        if (update_uds_interest(*app, false))
-            destroy_app(app->fd);
+        assert(false && "unowned management result");
     }
 }
 
@@ -2334,7 +2851,8 @@ static void poll_pending_queues()
         }
         if (std::chrono::steady_clock::now() >= app.uds_queue_deadline)
             prepare_uds_response(app, UdsState::SendError, REG_FAIL, -ENOSPC);
-        else if (etran_nic->_free_exclusive_qids.size() >= app.uds_req.nr_nic_queues)
+        else if (app.uds_resource_epoch != resource_epoch &&
+                 etran_nic->_free_exclusive_qids.size() >= app.uds_req.nr_nic_queues)
             start_uds_registration(app);
         if (update_uds_interest(app, false))
             destroy_app(app.fd);
@@ -2487,10 +3005,10 @@ struct CcJitter {
         return bins.size() - 1;
     }
 
-    void report() const
+    void report(const char *scope) const
     {
-        fprintf(stderr, "cc_jitter samples=%llu p50_bucket_us=%zu p99_bucket_us=%zu max_us=%llu gt300=%llu gt500=%llu\n",
-                static_cast<unsigned long long>(samples), quantile(50), quantile(99),
+        fprintf(stderr, "cc_jitter_%s samples=%llu p50_bucket_us=%zu p99_bucket_us=%zu max_us=%llu gt300=%llu gt500=%llu\n",
+                scope, static_cast<unsigned long long>(samples), quantile(50), quantile(99),
                 static_cast<unsigned long long>(maximum), static_cast<unsigned long long>(slow300),
                 static_cast<unsigned long long>(slow500));
     }
@@ -2501,7 +3019,7 @@ static void *control_loop(void *arg)
     struct epoll_event ev;
     uint64_t tcp_s, tcp_e, homa_next_tsc = 0;
     const bool track_cc_jitter = collect_cc_jitter();
-    CcJitter cc_jitter;
+    CcJitter cc_jitter, cc_jitter_active;
 
     epfd = epoll_create1(0);
     if (epfd < 0)
@@ -2541,8 +3059,13 @@ static void *control_loop(void *arg)
 
         /* poll tcp congestion control and timeout events */
         tcp_s = get_cycles();
-        if (track_cc_jitter)
+        if (track_cc_jitter) {
             cc_jitter.observe(tcp_s);
+            if (next_tcp_cc_to_tsc != UINT64_MAX)
+                cc_jitter_active.observe(tcp_s);
+            else
+                cc_jitter_active.previous = 0;
+        }
         poll_tcp_cc_to();
         tcp_e = get_cycles();
 
@@ -2566,8 +3089,10 @@ static void *control_loop(void *arg)
         }
     }
 
-    if (track_cc_jitter)
-        cc_jitter.report();
+    if (track_cc_jitter) {
+        cc_jitter_active.report("active");
+        cc_jitter.report("all");
+    }
     destroy_all_apps();
     close(epfd);
     return nullptr;
@@ -2608,13 +3133,17 @@ int thread_init(void)
     }
 
     int mgmt_cpu = topology.control;
-    if (const char *value = std::getenv("ETRAN_SCHED_CPU")) {
+    const char *value = std::getenv("ETRAN_MGMT_CPU");
+    const char *affinity_var = value ? "ETRAN_MGMT_CPU" : "ETRAN_SCHED_CPU";
+    if (!value)
+        value = std::getenv(affinity_var);
+    if (value) {
         char *end;
         const auto parsed = strtol(value, &end, 10);
         if (end == value || *end || parsed < 0 || parsed >= CPU_SETSIZE ||
             !std::binary_search(topology.online.begin(), topology.online.end(), parsed) ||
             std::binary_search(topology.pool.begin(), topology.pool.end(), parsed) || parsed == topology.control) {
-            fprintf(stderr, "Invalid ETRAN_SCHED_CPU for RSS management\n");
+            fprintf(stderr, "%s must be online and outside the data and control CPU sets\n", affinity_var);
             destroy_uds_ctx(uds_sockfd);
             return -EINVAL;
         }
@@ -2634,6 +3163,7 @@ int thread_init(void)
         destroy_uds_ctx(uds_sockfd);
         return -error;
     }
+    printf("Management CPU: %d\n", mgmt_cpu);
 
     cpu_set_t requested;
     CPU_ZERO(&requested);

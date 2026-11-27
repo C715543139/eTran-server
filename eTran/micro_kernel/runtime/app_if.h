@@ -50,7 +50,8 @@ struct fd_rule_t {
 };
 
 enum class UdsState {
-    RecvRequest, SendCpuReady, RecvCpu, WaitQueue, WaitMgmt, SendXsk, SendEvent, SendDone, SendError, Ready
+    RecvRequest, SendCpuReady, RecvCpu, WaitQueue, WaitMgmt, WaitTeardown,
+    SendXsk, SendEvent, SendDone, SendError, Ready
 };
 
 // application context in kernel
@@ -69,6 +70,8 @@ struct app_ctx
     unsigned int uds_fd_batch = 0;
     int uds_requested_cpu = -1;
     std::chrono::steady_clock::time_point uds_queue_deadline{};
+    uint64_t uds_resource_epoch = 0;
+    int registration_error = 0;
 
     // transport protocol
     int proto;
@@ -79,11 +82,14 @@ struct app_ctx
     // if we have allocated resources for this application
     bool done;
     bool resources_ready = false;
+    bool managed_tcp = false;
 
     // used in process_packet()
     bool need_refill = false;
 
     std::set<uint16_t> ports;
+    std::unordered_map<uint16_t, unsigned int> tcp_port_refs;
+    unsigned int pending_rule_io = 0;
 
     std::vector<struct fd_rule_t> flow_director_rules;
 

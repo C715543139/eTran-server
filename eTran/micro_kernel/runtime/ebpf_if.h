@@ -116,6 +116,7 @@ struct nic_queue_info
 void xsk_delete_socket(struct xsk_socket_info *xsk_info);
 
 struct xsk_socket_info *xsk_configure_socket(struct nic_queue_info *nic_queue, int proto);
+struct xsk_socket_info *xsk_configure_socket_for_queue(struct buffer_pool_wrapper *bpw, unsigned int qid, int proto);
 
 #define HOMA_TX_FLAG_OFFSET 24
 #define HOMA_TX_FROM_SLOW_PATH_OFFSET 20

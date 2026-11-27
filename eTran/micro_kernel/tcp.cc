@@ -31,6 +31,8 @@ std::unordered_map<struct listen_tuple, std::vector<struct tcp_listener *>, list
 std::mutex tcp_listeners_lock;
 
 std::list<struct tcp_connection *> tcp_handshake_list;
+static std::unordered_map<uint64_t, tcp_connection *> pending_rule_connections;
+static uint64_t next_rule_cookie;
 
 // ebpf.cc
 extern class eTranTCP *etran_tcp;
@@ -57,6 +59,8 @@ extern int alloc_port(void);
 extern int free_port(uint16_t port);
 extern int record_port(struct app_ctx *actx, uint16_t local_port, uint16_t remote_port);
 extern int unrecord_port(struct app_ctx *actx, uint16_t port);
+extern int record_tcp_port(app_ctx &app, uint16_t local, uint16_t remote, uint64_t cookie);
+extern void unrecord_tcp_port(app_ctx &app, uint16_t local, uint16_t remote);
 
 // cc.cc
 extern void timely_cc(struct tcp_connection *c, struct bpf_cc_snapshot *cc, uint64_t curr_tsc);
@@ -79,12 +83,13 @@ void notify_app_tcp_status_close(struct app_ctx_per_thread *tctx, opaque_ptr c, 
 void slow_path_send_tcp(struct app_ctx *actx, struct pkt_tcp *tcphdr, uint16_t len, bool to, uint32_t qid);
 
 // internal functions
-static inline struct tcp_connection *find_tcp_conn_slowpath(opaque_ptr opaque_connection)
+static inline struct tcp_connection *find_tcp_conn_slowpath(const app_ctx_per_thread *owner,
+                                                           opaque_ptr opaque_connection)
 {
     std::lock_guard<std::mutex> lock(tcp_connections_lock);
     for (auto it = tcp_connections.begin(); it != tcp_connections.end(); it++)
     {
-        if (it->second->opaque_connection == opaque_connection)
+        if (it->second->tctx->actx == owner->actx && it->second->opaque_connection == opaque_connection)
         {
             return it->second;
         }
@@ -181,23 +186,33 @@ static inline int parse_tcp_opts(struct pkt_tcp *p, struct tcp_opts *opts)
     return 0;
 }
 
+static void release_tcp_port(tcp_connection &c)
+{
+    if (c.managed_rule)
+        unrecord_tcp_port(*c.tctx->actx, c.local_port, c.rule_remote_port);
+    else {
+        unrecord_port(c.tctx->actx, c.local_port);
+        free_port(c.local_port);
+    }
+}
+
 void _tcp_connection_close(struct tcp_connection *c, enum connection_status status, bool send_rst)
 {
-    /* this struct is created for listener */
-    if (c->type == TCP_CONN_TYPE_FAKE)
-    {
-        unrecord_port(c->tctx->actx, c->local_port);
-        free_port(c->local_port);
-        std::lock_guard<std::mutex> lock(tcp_connections_lock);
-        tcp_connections.erase(flow_tuple(c->remote_ip, c->remote_port, c->local_ip, c->local_port));
-        delete c;
-        return;
+    if (c->rule_cookie) {
+        pending_rule_connections.erase(c->rule_cookie);
+        send_rst = false;
     }
-
+    tcp_handshake_list.remove(c);
     /* step1: remove from tcp_connections */
     tcp_connections_lock.lock();
     unreg_tcp_conn_slowpath(c);
     tcp_connections_lock.unlock();
+
+    if (c->type == TCP_CONN_TYPE_FAKE) {
+        release_tcp_port(*c);
+        delete c;
+        return;
+    }
 
     /* step2: delete ebpf states if needed */
     if (c->status == CONN_OPEN || c->status == CONN_WAIT_TX_SYNACK)
@@ -207,10 +222,7 @@ void _tcp_connection_close(struct tcp_connection *c, enum connection_status stat
 
     /* step3: free port if this connection is created through connect() */
     if (!c->listener)
-    {
-        unrecord_port(c->tctx->actx, c->local_port);
-        free_port(c->local_port);
-    }
+        release_tcp_port(*c);
 
     /* step4: send TCP_RST if needed */
     if (send_rst)
@@ -1142,14 +1154,14 @@ int tcp_listen(struct app_ctx_per_thread *tctx, struct appout_tcp_listen_t *tcp_
     opaque_ptr opaque_listener = tcp_listen_msg_in->opaque_listener;
     unsigned int backlog = tcp_listen_msg_in->backlog;
 
-    c = find_tcp_conn_slowpath(opaque_connection);
+    c = find_tcp_conn_slowpath(tctx, opaque_connection);
 
     // it seems that no bind() for it
     if (!c)
         return -1;
 
     // not a connection used for listen
-    if (c->type != TCP_CONN_TYPE_FAKE)
+    if (c->type != TCP_CONN_TYPE_FAKE || c->rule_cookie)
         return -1;
 
     port = c->local_port;
@@ -1272,6 +1284,51 @@ int tcp_accept(struct app_ctx_per_thread *tctx, struct appout_tcp_accept_t *tcp_
     return 0;
 }
 
+static void finish_tcp_open(tcp_connection &c)
+{
+    tcp_handshake_list.push_back(&c);
+    notify_app_tcp_conn_open(c.tctx, c.opaque_connection, c.fd, 0, &c);
+}
+
+static int start_tcp_rule(tcp_connection &c, uint16_t remote)
+{
+    auto &app = *c.tctx->actx;
+    if (!app.managed_tcp) {
+        record_port(&app, c.local_port, remote);
+        return 0;
+    }
+    if (++next_rule_cookie == 0)
+        ++next_rule_cookie;
+    const int error = record_tcp_port(app, c.local_port, remote, next_rule_cookie);
+    if (error && error != -EINPROGRESS)
+        return error;
+    c.managed_rule = true;
+    c.rule_remote_port = remote;
+    if (error == -EINPROGRESS) {
+        c.rule_cookie = next_rule_cookie;
+        pending_rule_connections.emplace(c.rule_cookie, &c);
+    }
+    return 0;
+}
+
+void tcp_flow_rule_ready(uint64_t cookie, int error)
+{
+    auto it = pending_rule_connections.find(cookie);
+    if (it == pending_rule_connections.end())
+        return;
+    auto *c = it->second;
+    pending_rule_connections.erase(it);
+    c->rule_cookie = 0;
+    if (c->type == TCP_CONN_TYPE_FAKE)
+        notify_app_tcp_status_bind(c->tctx, c->opaque_connection, c->fd, error);
+    else if (error)
+        notify_app_tcp_conn_open(c->tctx, c->opaque_connection, c->fd, error, nullptr);
+    else
+        finish_tcp_open(*c);
+    if (error)
+        _tcp_connection_close(c, CONN_CLOSED, false);
+}
+
 int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open_msg_in)
 {
     struct tcp_connection *c;
@@ -1283,7 +1340,7 @@ int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open
     uint32_t remote_ip = tcp_open_msg_in->remote_ip;
     uint16_t remote_port = tcp_open_msg_in->remote_port;
 
-    c = find_tcp_conn_slowpath(opaque_connection);
+    c = find_tcp_conn_slowpath(tctx, opaque_connection);
 
     /* no bind() called for this connection before */
     if (!c)
@@ -1299,7 +1356,11 @@ int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open
             return -1;
         }
         local_port = ret;
-        record_port(tctx->actx, local_port, remote_port);
+    } else {
+        if (c->rule_cookie || c->type != TCP_CONN_TYPE_FAKE)
+            return -EALREADY;
+        std::lock_guard<std::mutex> lock(tcp_connections_lock);
+        unreg_tcp_conn_slowpath(c);
     }
     c->release = tcp_connection_close;
 
@@ -1326,11 +1387,16 @@ int tcp_open(struct app_ctx_per_thread *tctx, struct appout_tcp_open_t *tcp_open
     c->remote_seq = 0;
     c->local_seq = 0;
 
+    if (local_port) {
+        if (const int error = start_tcp_rule(*c, remote_port)) {
+            free_port(local_port);
+            delete c;
+            return error;
+        }
+    }
     reg_tcp_conn_slowpath(c);
-
-    tcp_handshake_list.push_back(c);
-
-    notify_app_tcp_conn_open(tctx, c->opaque_connection, c->fd, 0, c);
+    if (!c->rule_cookie)
+        finish_tcp_open(*c);
 
     return 0;
 }
@@ -1347,7 +1413,7 @@ int tcp_bind(struct app_ctx_per_thread *tctx, struct appout_tcp_bind_t *tcp_bind
     // FIXME
     (void)_local_ip;
 
-    c = find_tcp_conn_slowpath(opaque_connection);
+    c = find_tcp_conn_slowpath(tctx, opaque_connection);
     if (c)
         return -EADDRINUSE;
 
@@ -1356,11 +1422,13 @@ int tcp_bind(struct app_ctx_per_thread *tctx, struct appout_tcp_bind_t *tcp_bind
         return -ENOMEM;
     c->release = tcp_connection_close;
 
-    if (alloc_port(local_port))
+    const bool claimed = alloc_port(local_port) == 0;
+    if (!claimed)
     {
         if (reuseport)
         {
-            if (tctx->actx->ports.find(local_port) != tctx->actx->ports.end())
+            if (tctx->actx->managed_tcp ? tctx->actx->tcp_port_refs.count(local_port) :
+                                         tctx->actx->ports.count(local_port))
             {
                 // ok, this port belongs to this application
             }
@@ -1390,11 +1458,17 @@ int tcp_bind(struct app_ctx_per_thread *tctx, struct appout_tcp_bind_t *tcp_bind
     c->opaque_connection = opaque_connection;
     c->flags = 0;
 
-    record_port(c->tctx->actx, c->local_port, 0);
+    if (const int error = start_tcp_rule(*c, 0)) {
+        if (claimed)
+            free_port(local_port);
+        delete c;
+        return error;
+    }
 
     reg_tcp_conn_slowpath(c);
 
-    notify_app_tcp_status_bind(tctx, c->opaque_connection, c->fd, 0);
+    if (!c->rule_cookie)
+        notify_app_tcp_status_bind(tctx, c->opaque_connection, c->fd, 0);
 
     return 0;
 }
@@ -1452,7 +1526,7 @@ int tcp_close(struct app_ctx_per_thread *tctx, struct appout_tcp_close_t *tcp_cl
     opaque_ptr opaque_connection = tcp_close_msg_in->opaque_connection;
     int fd = tcp_close_msg_in->fd;
 
-    c = find_tcp_conn_slowpath(opaque_connection);
+    c = find_tcp_conn_slowpath(tctx, opaque_connection);
     if (!c)
         return -1;
 

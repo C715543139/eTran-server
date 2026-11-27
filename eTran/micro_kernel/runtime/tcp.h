@@ -272,6 +272,9 @@ struct tcp_connection
     int listen_fd;
 
     bool reuseport;
+    bool managed_rule = false;
+    uint16_t rule_remote_port = 0;
+    uint64_t rule_cookie = 0;
 
     opaque_ptr opaque_connection;
 
@@ -409,3 +412,4 @@ void *tcp_timer_loop(void *arg);
 void process_tcp_cmd(struct app_ctx_per_thread *tctx, lrpc_msg *msg);
 
 void free_tcp_resources(struct app_ctx *actx);
+void tcp_flow_rule_ready(uint64_t cookie, int error);

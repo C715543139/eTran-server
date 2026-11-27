@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include <string>
+#include <new>
 
 struct shm_wrapper *_shm_wrapper_create(const std::string &__name, size_t __len, int __oflag, mode_t __mode)
 {
@@ -19,7 +20,7 @@ struct shm_wrapper *_shm_wrapper_create(const std::string &__name, size_t __len,
     void *addr;
     struct shm_wrapper *mem = NULL;
 
-    mem = (struct shm_wrapper *)calloc(1, sizeof(struct shm_wrapper));
+    mem = new (std::nothrow) shm_wrapper{};
     if (mem == NULL) {
         fprintf(stderr, "Failed to allocate memory for shared memory\n");
         return NULL;
@@ -32,9 +33,17 @@ struct shm_wrapper *_shm_wrapper_create(const std::string &__name, size_t __len,
         goto err;
     }
 
-    if (ftruncate(fd, __len) < 0) {
-        fprintf(stderr, "Failed to truncate shared memory\n");
-        goto err;
+    if (__oflag & O_CREAT) {
+        if (fchmod(fd, __mode) < 0 || ftruncate(fd, __len) < 0) {
+            perror("Failed to initialize shared memory");
+            goto err;
+        }
+    } else {
+        struct stat status{};
+        if (fstat(fd, &status) < 0 || status.st_size < 0 || static_cast<size_t>(status.st_size) < __len) {
+            fprintf(stderr, "Shared memory %s is shorter than requested\n", __name.c_str());
+            goto err;
+        }
     }
 
     addr = mmap(NULL, __len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, 0);
@@ -53,24 +62,19 @@ struct shm_wrapper *_shm_wrapper_create(const std::string &__name, size_t __len,
 
     return mem;
 err:
-    close(fd);
-    free(mem);
+    if (fd >= 0) {
+        close(fd);
+        if (__oflag & O_CREAT)
+            shm_unlink(__name.c_str());
+    }
+    delete mem;
     return NULL;
 }
 
 struct shm_wrapper *shm_wrapper_create(const std::string &__name, size_t __len)
 {
-    struct shm_wrapper *mem;
     shm_unlink(__name.c_str());
-    mode_t old_mask = umask(0);
-
-    mem = _shm_wrapper_create(__name, __len, O_RDWR | O_CREAT | O_EXCL, 0666);
-    if (!mem) {
-        umask(old_mask);
-        return NULL;
-    }
-    umask(old_mask);
-    return mem;
+    return _shm_wrapper_create(__name, __len, O_RDWR | O_CREAT | O_EXCL, 0666);
 }
 
 struct shm_wrapper *shm_wrapper_attach(const std::string &__name, size_t __len)
@@ -95,10 +99,9 @@ void shm_wrapper_destroy(struct shm_wrapper *mem)
     /* unlink this shm */
     if (shm_unlink(mem->name.c_str()) < 0) {
         fprintf(stderr, "Failed to unlink shared memory %s\n", mem->name.c_str());
-        return;
-    }
-    printf("%s has been destroyed.\n", mem->name.c_str());
-    free(mem);
+    } else
+        printf("%s has been destroyed.\n", mem->name.c_str());
+    delete mem;
 
     return;
 }
@@ -112,7 +115,7 @@ void shm_wrapper_detach(struct shm_wrapper *mem)
         fprintf(stderr, "Failed to unmap shared memory\n");
     }
     printf("%s has been detached.\n", mem->name.c_str());
-    free(mem);
+    delete mem;
     
     return;
 }

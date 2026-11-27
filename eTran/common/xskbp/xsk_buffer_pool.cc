@@ -162,6 +162,7 @@ err:
         shm_wrapper_destroy(shm_umem);
     if (shm_bp)
         shm_wrapper_destroy(shm_bp);
+    *bpw = {};
     return -1;
 }
 

@@ -43,12 +43,14 @@ void xsk_delete_socket(struct xsk_socket_info *xsk_info)
 
 struct xsk_socket_info *xsk_configure_socket(struct nic_queue_info *nic_queue, int proto)
 {
+    return xsk_configure_socket_for_queue(nic_queue->bpw, nic_queue->qid, proto);
+}
+
+struct xsk_socket_info *xsk_configure_socket_for_queue(struct buffer_pool_wrapper *bpw, unsigned int qid, int proto)
+{
     int ret = 0;
     struct xsk_socket_config cfg = {0};
     struct ebpf_info_t *ebpf_info;
-
-    struct buffer_pool_wrapper *bpw = nic_queue->bpw;
-    unsigned int qid = nic_queue->qid;
 
     struct xsk_socket_info *xsk_info =
         reinterpret_cast<struct xsk_socket_info *>(calloc(1, sizeof(struct xsk_socket_info)));
@@ -63,8 +65,10 @@ struct xsk_socket_info *xsk_configure_socket(struct nic_queue_info *nic_queue, i
         ebpf_info = &etran_homa->_ebpf;
     else if (proto == IPPROTO_TCP)
         ebpf_info = &etran_tcp->_ebpf;
-    else
+    else {
+        free(xsk_info);
         return nullptr;
+    }
 
     xsk_info->umem = bpw->bp->umem;
     xsk_info->umem_area = reinterpret_cast<char *>(bpw->shm_umem->addr);
