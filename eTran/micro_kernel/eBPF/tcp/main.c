@@ -234,11 +234,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
     __builtin_memcpy(eth->h_source, c->local_mac, ETH_ALEN);
 
     if (ret == XDP_REDIRECT) {
-        if (qid_stats_enabled) {
-            __u32 qid = ctx->rx_queue_index;
-            if (qid < MAX_NIC_QUEUES)
-                ++qid_napi_stats[qid].tw_enq_attempts;
-        }
+#if ETRAN_STATIC_QID_STATS
+        __u32 qid = ctx->rx_queue_index;
+        if (qid < MAX_NIC_QUEUES)
+            ++qid_napi_stats[qid].tw_enq_attempts;
+#endif
         kick_tw();
         return ret;
     } else if (ret == XDP_PASS) {
@@ -251,11 +251,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
     xdp_egress_dump_ip(iph);
     xdp_egress_dump_tcp(tcph);
     #endif
-    if (qid_stats_enabled) {
-        __u32 qid = ctx->rx_queue_index;
-        if (qid < MAX_NIC_QUEUES)
-            qid_napi_stats[qid].tx_direct += QID_COUNTER_PACKET + (__u64)(data_end - data);
-    }
+#if ETRAN_STATIC_QID_STATS
+    __u32 qid = ctx->rx_queue_index;
+    if (qid < MAX_NIC_QUEUES)
+        qid_napi_stats[qid].tx_direct += QID_COUNTER_PACKET + (__u64)(data_end - data);
+#endif
     return XDP_TX;
 
 redirect:
@@ -376,13 +376,15 @@ int xdp_sock_prog(struct xdp_md *ctx)
     barrier_var(qid);
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         ret = bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
-        if (qid_stats_enabled && ret == XDP_REDIRECT) {
+#if ETRAN_STATIC_QID_STATS
+        if (ret == XDP_REDIRECT) {
             // Keep the mask in BPF instructions even when Clang proves the earlier bound.
             __u32 stats_qid = qid;
             barrier_var(stats_qid);
             stats_qid &= MAX_NIC_QUEUES - 1;
             qid_napi_stats[stats_qid].rx_xsk += QID_COUNTER_PACKET + pkt_len;
         }
+#endif
         return ret;
     }
 

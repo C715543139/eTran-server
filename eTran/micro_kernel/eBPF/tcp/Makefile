@@ -8,3 +8,5 @@ BPF_CFLAGS := -Wno-address-of-packed-member -I../../../intf -I../../../common/
 
 LIB_DIR = ../../../../lib
 include $(LIB_DIR)/common.mk
+
+main.o: BPF_CFLAGS += -DETRAN_STATIC_QID_STATS=0

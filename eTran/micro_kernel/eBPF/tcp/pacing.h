@@ -162,9 +162,11 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
     tw_map = (struct bpf_map *)tw;
 
     if (!pkt_queue_pending(tw_map)) {
+#if ETRAN_STATIC_QID_STATS
         barrier_var(cpu);
-        if (qid_stats_enabled && cpu < MAX_CPU)
+        if (cpu < MAX_CPU)
             tw_pending_by_cpu[cpu] = 0;
+#endif
         return 0;
     }
     now = bpf_ktime_get_ns();
@@ -180,17 +182,17 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
             continue;
         }
 
-        struct bpf_qid_tw_stats *stats = NULL;
-        __u32 frame_len = 0;
-        if (qid_stats_enabled) {
-            stats = qid_tw_stats(xdpf->queue_index);
-            frame_len = xdpf->len;
-        }
+#if ETRAN_STATIC_QID_STATS
+        struct bpf_qid_tw_stats *stats = qid_tw_stats(xdpf->queue_index);
+        __u32 frame_len = xdpf->len;
+#endif
 
         if (unlikely(bpf_dynptr_from_xdp_frame(xdpf, 0, &ptr))) {
             log_panic("bpf_dynptr_from_xdp_frame failed");
+#if ETRAN_STATIC_QID_STATS
             if (stats)
                 ++stats->tw_drop_pkts;
+#endif
             bpf_packet_drop(xdpf);
             continue;
         }
@@ -199,8 +201,10 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
                             NULL, sizeof(*ts_opt));
         if (unlikely(!ts_opt)) {
             log_panic("bpf_dynptr_slice_rdwr failed");
+#if ETRAN_STATIC_QID_STATS
             if (stats)
                 ++stats->tw_drop_pkts;
+#endif
             bpf_packet_drop(xdpf);
             continue;
         }
@@ -208,15 +212,19 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
         ts_opt->ts_val = bpf_htonl((__u32)now);
         
         if (unlikely(bpf_packet_send(xdpf, xdpf->tx_ifindex, 0))) {
+#if ETRAN_STATIC_QID_STATS
             if (stats)
                 ++stats->tw_drop_pkts;
+#endif
             bpf_packet_drop(xdpf);
             continue;
         }
+#if ETRAN_STATIC_QID_STATS
         if (stats) {
             ++stats->tw_sent_pkts;
             stats->tw_sent_bytes += frame_len;
         }
+#endif
         submitted = true;
     }
 
@@ -224,9 +232,11 @@ static int tw_cb(void *map, int *map_key, struct tw_trigger_t *twt)
         bpf_packet_flush();
 
     bool pending = pkt_queue_pending(tw_map);
+#if ETRAN_STATIC_QID_STATS
     barrier_var(cpu);
-    if (qid_stats_enabled && cpu < MAX_CPU)
+    if (cpu < MAX_CPU)
         tw_pending_by_cpu[cpu] = pending;
+#endif
     if (pending)
         kick_tw();
 

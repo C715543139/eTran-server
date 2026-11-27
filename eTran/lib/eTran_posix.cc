@@ -443,10 +443,11 @@ static inline int connection_prepare_buffer(struct app_ctx_per_thread *tctx, str
     return 0;
 }
 
+template <int order = __ATOMIC_ACQUIRE>
 static bool apply_worker_sched_command(struct app_ctx_per_thread *tctx)
 {
     auto *ctrl = tctx->sched_ctrl;
-    const uint64_t command = __atomic_load_n(&ctrl->cmd_word, __ATOMIC_SEQ_CST);
+    const uint64_t command = __atomic_load_n(&ctrl->cmd_word, order);
     const uint32_t seq = command >> 32;
     if (seq == 0 || seq == tctx->last_applied_seq)
         return false;
@@ -658,9 +659,10 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
 
     nr_event += process_tcp_kernel_events(tctx, ret_events + nr_event, budget - nr_event);
     auto *ctrl = tctx->sched_ctrl;
-    if (ctrl && !nr_event && timeout != 0) {
+    const bool marked_sleeping = ctrl && !nr_event && timeout != 0;
+    if (marked_sleeping) {
         __atomic_store_n(&ctrl->state_flags, WORKER_FLAG_SLEEPING, __ATOMIC_SEQ_CST);
-        if (apply_worker_sched_command(tctx))
+        if (apply_worker_sched_command<__ATOMIC_SEQ_CST>(tctx))
             timeout = 0;
     } else {
         timeout = 0;
@@ -668,10 +670,10 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
 
     // step2: receive packets (<= budget) from **all** NIC queues in a deficit round-robin manner
     nfds = libc_epoll_wait(tctx->epfd, events, nr_nic_queues + 1, timeout);
-    if (ctrl) {
+    if (marked_sleeping)
         __atomic_store_n(&ctrl->state_flags, 0, __ATOMIC_SEQ_CST);
+    if (ctrl)
         apply_worker_sched_command(tctx);
-    }
     if (unlikely(nfds < 0))
     {
         perror("epoll_wait");
