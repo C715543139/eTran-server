@@ -229,11 +229,18 @@ struct QueueRate {
     double irq_share = -1;
     bool self_folded_large = false;
     bool ready_to_merge = false;
-    // Keep the incumbent's pre-contention rate while the newcomer warms up.
-    std::array<double, 40> bps_history{}, pps_history{};
+    std::array<double, 10> bps_history{}, pps_history{};
     unsigned int next = 0;
+
+    double peak_bps() const { return *std::max_element(bps_history.begin(), bps_history.end()); }
+    double peak_pps() const { return *std::max_element(pps_history.begin(), pps_history.end()); }
 };
 std::array<QueueRate, MAX_NIC_QUEUES> last_rates;
+struct IncumbentRate {
+    uint64_t generation = 0;
+    double bps = 0, pps = 0;
+};
+std::array<std::array<IncumbentRate, MAX_NIC_QUEUES>, MAX_NIC_QUEUES> admission_rates;
 std::thread sampler;
 std::condition_variable sampler_wake;
 std::mutex sampler_mutex;
@@ -477,8 +484,11 @@ bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now)
             now - rate.time > 2 * sample_period)
             return false;
         confirmed += q != qid;
-        bps += *std::max_element(rate.bps_history.begin(), rate.bps_history.end());
-        pps += *std::max_element(rate.pps_history.begin(), rate.pps_history.end());
+        auto &admitted = admission_rates[qid][q];
+        if (admitted.generation != slot.generation || light_queue(last_profiles[q]))
+            admitted = {};
+        bps += std::max(rate.peak_bps(), admitted.bps);
+        pps += std::max(rate.peak_pps(), admitted.pps);
     }
     const auto probe_room = [&] {
         if (!settings().probe_enabled)
@@ -1005,6 +1015,19 @@ void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, i
     last_profiles[qid] = Profile::Unknown;
     last_irq_progress[qid] = {};
     last_rates[qid] = {};
+    if (settings().active) {
+        // A contending newcomer can depress an incumbent's measured rate for its entire warmup.
+        auto &rates = admission_rates[qid];
+        rates.fill({});
+        const auto now = Clock::now();
+        for (unsigned other = 0; other < registrations.size(); ++other) {
+            const auto &incumbent = registrations[other];
+            const auto &rate = last_rates[other];
+            if (other != qid && incumbent.pid && last_profiles[other] == Profile::Heavy &&
+                now - rate.time <= 2 * sample_period)
+                rates[other] = {incumbent.generation, rate.peak_bps(), rate.peak_pps()};
+        }
+    }
 }
 
 void scheduler_unregister_queue(unsigned int qid)
