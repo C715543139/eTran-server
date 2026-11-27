@@ -15,6 +15,7 @@ struct SchedulerIrqProgress {
 };
 
 SchedulerIrqProgress scheduler_irq_progress(unsigned int qid, int source, int target);
+void scheduler_track_irq_handoff(unsigned int qid, bool moving);
 int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_fd, int tw_fd,
                     int tw_pending_fd, const bpf_cc_map_user *cc);
 void stop_scheduler();

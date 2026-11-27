@@ -251,11 +251,11 @@ int xdp_egress_prog(struct xdp_md *ctx)
     xdp_egress_dump_ip(iph);
     xdp_egress_dump_tcp(tcph);
     #endif
-    if (qid_stats_enabled && ret == XDP_TX) {
+    if (qid_stats_enabled) {
         __u32 qid = ctx->rx_queue_index;
         if (qid < MAX_NIC_QUEUES) {
             ++qid_napi_stats[qid].tx_direct_pkts;
-            qid_napi_stats[qid].tx_direct_bytes += ctx->data_end - ctx->data;
+            qid_napi_stats[qid].tx_direct_bytes += data_end - data;
         }
     }
     return XDP_TX;
@@ -378,10 +378,10 @@ int xdp_sock_prog(struct xdp_md *ctx)
     barrier_var(qid);
     if (likely(ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES)) {
         ret = bpf_redirect_map(&xsks_map, c->qid2xsk[qid], XDP_DROP);
-        barrier_var(qid);
-        if (qid_stats_enabled && ret == XDP_REDIRECT && qid < MAX_NIC_QUEUES) {
-            ++qid_napi_stats[qid].rx_xsk_pkts;
-            qid_napi_stats[qid].rx_xsk_bytes += pkt_len;
+        if (qid_stats_enabled && ret == XDP_REDIRECT) {
+            __u32 stats_qid = qid & (MAX_NIC_QUEUES - 1);
+            ++qid_napi_stats[stats_qid].rx_xsk_pkts;
+            qid_napi_stats[stats_qid].rx_xsk_bytes += pkt_len;
         }
         return ret;
     }

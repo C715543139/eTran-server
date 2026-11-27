@@ -22,6 +22,7 @@
 #include <bpf/libbpf.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 
 #include <runtime/cpu_topology.h>
 #include <intf/intf_ebpf.h>
@@ -128,6 +129,7 @@ struct Registration {
     int irq_cpu = -1;
     int app_cpu = -1;
     int tid = 0;
+    bool irq_handoff = false;
 };
 
 enum class Profile { Unknown, Idle, Light, Heavy };
@@ -166,6 +168,7 @@ struct QueueSample {
     unsigned int high = 0, low = 0, idle = 0;
     double bps = 0, pps = 0;
     bool sampled = false, paced = false, drops = false;
+    bool wheel_followup = false;
     bool noisy = false;
     int tid = 0;
     uint64_t last_wait = 0;
@@ -190,40 +193,100 @@ std::unique_ptr<SoftirqProbe> probe;
 // The control plane publishes a fresh token before a reused CC slot can be sampled.
 // Zero in the low word means unregistered. The high word is the slot generation.
 std::array<std::atomic<uint64_t>, MAX_TCP_FLOWS> flow_slots{};
+struct FlowRegistration {
+    unsigned int index;
+    uint64_t token;
+};
+std::vector<FlowRegistration> active_flows;
+std::array<unsigned int, MAX_TCP_FLOWS> flow_positions{};
+std::array<uint64_t, MAX_NIC_QUEUES> flow_revisions{};
 
 struct FlowSample {
     uint64_t token = 0;
     uint32_t ack = 0;
     unsigned quiet = 0;
+    unsigned epoch = 0;
 };
 
 struct QueueProgress {
-    bool inflight = false, stalled = false;
+    bool known = false, inflight = false, stalled = false;
 };
 
 void sample_progress(const bpf_cc_map_user &cc, std::vector<FlowSample> &flows,
+                     const std::vector<FlowRegistration> &active, unsigned int epoch,
                      std::array<QueueProgress, MAX_NIC_QUEUES> &progress)
 {
-    for (size_t i = 0; i < flows.size(); ++i) {
-        uint64_t token = flow_slots[i].load(std::memory_order_acquire);
+    for (const auto &[i, token] : active) {
         unsigned qid = static_cast<uint32_t>(token);
         if (!qid)
             continue;
+        auto &queue = progress[qid - 1];
+        if (!queue.known)
+            continue;
+        if (flow_slots[i].load(std::memory_order_acquire) != token) {
+            queue.known = false;
+            continue;
+        }
         const auto &entry = cc.entry[i];
         const auto ack = __atomic_load_n(&entry.cnt_rx_ack_bytes, __ATOMIC_RELAXED);
         const bool inflight = __atomic_load_n(&entry.txp, __ATOMIC_RELAXED) != 0;
-        if (flow_slots[i].load(std::memory_order_acquire) != token)
+        if (flow_slots[i].load(std::memory_order_acquire) != token) {
+            queue.known = false;
             continue;
+        }
         auto &sample = flows[i];
-        sample.quiet = sample.token == token && inflight && sample.ack == ack
+        sample.quiet = sample.token == token && sample.epoch == epoch - 1 && inflight && sample.ack == ack
                        ? std::min(sample.quiet + 1, 2U) : 0;
+        sample.epoch = epoch;
         sample.token = token;
         sample.ack = ack;
-        auto &queue = progress[qid - 1];
         queue.inflight |= inflight;
         queue.stalled |= sample.quiet >= 2;
     }
 }
+
+class NapiCounters {
+    using Samples = std::array<bpf_qid_napi_stats, MAX_NIC_QUEUES>;
+    const Samples *mapped = nullptr;
+    Samples fallback{};
+    int fd;
+
+public:
+    explicit NapiCounters(int map_fd) : fd(map_fd)
+    {
+        void *addr = mmap(nullptr, sizeof(Samples), PROT_READ, MAP_SHARED, fd, 0);
+        if (addr != MAP_FAILED)
+            mapped = static_cast<const Samples *>(addr);
+        if (settings().verbose)
+            fprintf(stderr, "sched_napi_read mode=%s\n", mapped ? "mmap" : "lookup");
+    }
+
+    ~NapiCounters()
+    {
+        if (mapped)
+            munmap(const_cast<Samples *>(mapped), sizeof(Samples));
+    }
+
+    bool refresh()
+    {
+        const __u32 key = 0;
+        return mapped || bpf_map_lookup_elem(fd, &key, fallback.data()) == 0;
+    }
+
+    bpf_qid_napi_stats read(unsigned int qid) const
+    {
+        if (!mapped)
+            return fallback[qid];
+        const auto &row = (*mapped)[qid];
+        bpf_qid_napi_stats sample{};
+        sample.rx_xsk_pkts = __atomic_load_n(&row.rx_xsk_pkts, __ATOMIC_RELAXED);
+        sample.rx_xsk_bytes = __atomic_load_n(&row.rx_xsk_bytes, __ATOMIC_RELAXED);
+        sample.tx_direct_pkts = __atomic_load_n(&row.tx_direct_pkts, __ATOMIC_RELAXED);
+        sample.tx_direct_bytes = __atomic_load_n(&row.tx_direct_bytes, __ATOMIC_RELAXED);
+        sample.tw_enq_attempts = __atomic_load_n(&row.tw_enq_attempts, __ATOMIC_RELAXED);
+        return sample;
+    }
+};
 
 bpf_qid_tw_stats sum_tw_stats(const std::vector<bpf_qid_tw_stats> &values)
 {
@@ -371,7 +434,7 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                    const std::vector<int> &pool)
 {
     std::array<QueueSample, MAX_NIC_QUEUES> queue_state{};
-    std::array<bpf_qid_napi_stats, MAX_NIC_QUEUES> napi{};
+    NapiCounters napi(napi_fd);
     std::array<__u32, MAX_CPU> pending{};
     std::vector<FlowSample> flows(MAX_TCP_FLOWS);
     std::vector<bpf_qid_tw_stats> per_cpu(cpus);
@@ -381,6 +444,8 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
     auto now = Clock::now();
     bool probe_baseline = false, counts_baseline = false;
     std::vector<WorkerSlot> worker_snapshot;
+    std::vector<FlowRegistration> flow_snapshot;
+    unsigned int epoch = 0;
     for (;;) {
         {
             std::unique_lock<std::mutex> lock(sampler_mutex);
@@ -390,11 +455,14 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
         const auto last_tick = now;
         now = Clock::now();
         const double tick_ns = std::chrono::duration<double, std::nano>(now - last_tick).count();
+        ++epoch;
         const __u32 zero = 0;
         const bool have_probe = softirq_fd >= 0 && !bpf_map_lookup_elem(softirq_fd, &zero, softirq.data());
-        const bool have_counts = softirq_fd < 0 && read_softirq_counts(counts);
-        const bool have_napi = !bpf_map_lookup_elem(napi_fd, &zero, napi.data());
+        const bool have_napi = napi.refresh();
         const bool have_pending = !bpf_map_lookup_elem(pending_fd, &zero, pending.data());
+        const bool any_pending = have_pending && std::any_of(pending.begin(), pending.end(), [](auto count) {
+            return count != 0;
+        });
         for (int cpu = 0; cpu < cpus; ++cpu) {
             auto &core = cores[cpu];
             if (have_probe && probe_baseline) {
@@ -412,32 +480,40 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
         }
 
         std::array<Registration, MAX_NIC_QUEUES> snapshot;
+        std::array<uint64_t, MAX_NIC_QUEUES> flow_versions;
         {
             std::lock_guard<std::mutex> lock(registration_mutex);
             snapshot = registrations;
+            flow_versions = flow_revisions;
+            flow_snapshot = active_flows;
             if (settings().shadow)
                 worker_snapshot = workers;
         }
         std::array<QueueProgress, MAX_NIC_QUEUES> progress{};
-        sample_progress(cc, flows, progress);
+        bool need_counts = false;
         for (__u32 qid = 0; qid < queues; ++qid) {
             const auto &app = snapshot[qid];
             auto &state = queue_state[qid];
             state.sampled = false;
             if (!app.pid)
                 continue;
-            if (!have_napi || bpf_map_lookup_elem(tw_fd, &qid, per_cpu.data())) {
+            const auto current = have_napi ? napi.read(qid) : bpf_qid_napi_stats{};
+            const bool first = state.generation != app.generation || state.last == Clock::time_point{};
+            const bool enqueued = current.tw_enq_attempts != state.napi.tw_enq_attempts;
+            const bool read_wheel = first || enqueued || state.paced || state.wheel_followup ||
+                                    !have_pending || pending[app.irq_cpu] != 0;
+            if (!have_napi || (read_wheel && bpf_map_lookup_elem(tw_fd, &qid, per_cpu.data()))) {
                 state.profile = Profile::Unknown;
                 state.last = {};
                 continue;
             }
-            const auto wheel = sum_tw_stats(per_cpu);
-            const auto &current = napi[qid];
-            if (state.generation != app.generation || state.last == Clock::time_point{}) {
+            const auto wheel = read_wheel ? sum_tw_stats(per_cpu) : state.wheel;
+            if (first) {
                 state = {};
                 state.generation = app.generation;
                 state.napi = current;
                 state.wheel = wheel;
+                state.wheel_followup = current.tw_enq_attempts != 0;
                 state.last = state.since = state.last_log = now;
                 continue;
             }
@@ -449,11 +525,17 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             const auto packets = current.rx_xsk_pkts - state.napi.rx_xsk_pkts +
                                  current.tx_direct_pkts - state.napi.tx_direct_pkts +
                                  wheel.tw_sent_pkts - state.wheel.tw_sent_pkts;
+            const bool high_progress = bytes * 8.0 * hz >= limits.b_high ||
+                                       packets * hz >= limits.p_high;
+            progress[qid].known = app.irq_handoff || !high_progress;
             state.bps = 0.6 * state.bps + 0.4 * (bytes * 8.0 * hz);
             state.pps = 0.6 * state.pps + 0.4 * (packets * hz);
             state.paced = (current.tw_enq_attempts - state.napi.tw_enq_attempts) * hz > 1000 ||
                           (wheel.tw_sent_pkts - state.wheel.tw_sent_pkts) * hz > 1000;
             state.drops = wheel.tw_drop_pkts != state.wheel.tw_drop_pkts;
+            state.wheel_followup = enqueued || state.drops || wheel.tw_sent_pkts != state.wheel.tw_sent_pkts ||
+                                   (state.wheel_followup && (!have_pending || any_pending));
+            need_counts |= app.irq_handoff || (state.bps < 1e6 && state.pps < 1000);
             update_wait(app, state, hz);
             state.last = now;
             state.napi = current;
@@ -464,6 +546,8 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             core.weights += load_weight(state);
         }
 
+        sample_progress(cc, flows, flow_snapshot, epoch, progress);
+        const bool have_counts = softirq_fd < 0 && need_counts && read_softirq_counts(counts);
         for (__u32 qid = 0; qid < queues; ++qid) {
             const auto &app = snapshot[qid];
             auto &state = queue_state[qid];
@@ -483,10 +567,10 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                                (valid_counts && (counts[app.irq_cpu] - last_counts[app.irq_cpu]) * 1e9 / tick_ns > 5000);
             state.noisy = noisy;
             const bool blocked = state.drops || progress[qid].stalled ||
-                                 (idle && (!have_pending || pending[app.irq_cpu] || noisy ||
+                                 (idle && (!progress[qid].known || !have_pending || pending[app.irq_cpu] || noisy ||
                                            (!valid_probe && !valid_counts)));
             state.high = heavy ? std::min(state.high + 1, 2U) : 0;
-            state.low = low && !blocked ? std::min(state.low + 1, 6U) : 0;
+            state.low = low && progress[qid].known && !blocked ? std::min(state.low + 1, 6U) : 0;
             state.idle = idle && !blocked && !progress[qid].inflight ? std::min(state.idle + 1, 10U) : 0;
             const auto before = state.profile;
             if (now - state.since < std::chrono::milliseconds(200) || (idle && blocked))
@@ -521,13 +605,17 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                 if (snapshot[qid].generation == registrations[qid].generation &&
                     snapshot[qid].pid && registrations[qid].pid) {
                     const auto &state = queue_state[qid];
-                    last_profiles[qid] = state.sampled && !state.drops && !progress[qid].stalled
+                    last_profiles[qid] = state.sampled && !state.drops && !progress[qid].stalled &&
+                                         flow_versions[qid] == flow_revisions[qid]
                                          ? state.profile : Profile::Unknown;
                     if (settings().manual) {
                         auto &irq = last_irq_progress[qid];
                         const auto packets = state.napi.rx_xsk_pkts + state.napi.tx_direct_pkts +
                                              state.wheel.tw_sent_pkts;
-                        irq.no_backlog = state.sampled && !state.drops && !state.noisy &&
+                        irq.no_backlog = state.sampled && (cores[snapshot[qid].irq_cpu].valid_probe ||
+                                         (have_counts && counts_baseline)) &&
+                                         flow_versions[qid] == flow_revisions[qid] &&
+                                         progress[qid].known && !state.drops && !state.noisy &&
                                          !progress[qid].inflight && !progress[qid].stalled;
                         if (packets != irq.packets || !irq.no_backlog || !irq.sampled_at.time_since_epoch().count())
                             irq.last_traffic = now;
@@ -574,6 +662,12 @@ SchedulerIrqProgress scheduler_irq_progress(unsigned int qid, int source, int ta
             drained && now - sample.last_traffic >= std::chrono::milliseconds(100)};
 }
 
+void scheduler_track_irq_handoff(unsigned int qid, bool moving)
+{
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    registrations[qid].irq_handoff = moving;
+}
+
 void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, int app_cpu)
 {
     if (!scheduler_collect_qid_stats())
@@ -597,15 +691,30 @@ void scheduler_register_flow(unsigned int cc_idx, unsigned int qid)
 {
     if (!scheduler_collect_qid_stats() || qid >= MAX_NIC_QUEUES)
         return;
+    std::lock_guard<std::mutex> lock(registration_mutex);
     auto &slot = flow_slots[cc_idx];
     const uint64_t generation = (slot.load(std::memory_order_relaxed) >> 32) + 1;
-    slot.store((generation << 32) | (qid + 1), std::memory_order_release);
+    const auto token = (generation << 32) | (qid + 1);
+    flow_positions[cc_idx] = active_flows.size();
+    active_flows.push_back({cc_idx, token});
+    ++flow_revisions[qid];
+    slot.store(token, std::memory_order_release);
 }
 
 void scheduler_unregister_flow(unsigned int cc_idx)
 {
-    if (scheduler_collect_qid_stats())
-        flow_slots[cc_idx].fetch_and(0xffffffff00000000ULL, std::memory_order_release);
+    if (!scheduler_collect_qid_stats())
+        return;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    const auto token = flow_slots[cc_idx].fetch_and(0xffffffff00000000ULL, std::memory_order_release);
+    const auto qid = static_cast<uint32_t>(token);
+    if (!qid)
+        return;
+    const auto position = flow_positions[cc_idx];
+    active_flows[position] = active_flows.back();
+    flow_positions[active_flows[position].index] = position;
+    active_flows.pop_back();
+    ++flow_revisions[qid - 1];
 }
 
 void scheduler_register_worker(unsigned int qid, int pid, int tid)

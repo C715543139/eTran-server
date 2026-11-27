@@ -894,6 +894,7 @@ class MigrationExecutor {
 
     void begin_irq(IrqMove &move, State state)
     {
+        scheduler_track_irq_handoff(move.qid, true);
         move.token = ++next_irq_token;
         move.state = state;
         move.began = Clock::now();
@@ -913,6 +914,7 @@ class MigrationExecutor {
         fprintf(stderr, "sched_migration kind=IRQ state=%s app_gen=%llu qid=%u token=%llu src=%d dst=%d\n",
                 state, static_cast<unsigned long long>(move.app->generation), move.qid,
                 static_cast<unsigned long long>(move.token), move.src, move.dst);
+        scheduler_track_irq_handoff(move.qid, false);
         irq_action.reset();
     }
 
@@ -1030,6 +1032,7 @@ public:
             } else if (io.sample.configured == move.src && io.sample.effective == move.src) {
                 release_cpu(*move.app, CpuRole::Irq, move.dst);
                 fprintf(stderr, "sched_migration kind=IRQ state=REJECTED qid=%u error=%d\n", move.qid, result.error);
+                scheduler_track_irq_handoff(move.qid, false);
                 irq_action.reset();
             } else
                 hold_irq(move, "QUARANTINED");
@@ -1065,6 +1068,7 @@ public:
         fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld\n",
                 move.qid, target, rollback, static_cast<unsigned long long>(current.done - move.base.done),
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+        scheduler_track_irq_handoff(move.qid, false);
         irq_action.reset();
     }
 
