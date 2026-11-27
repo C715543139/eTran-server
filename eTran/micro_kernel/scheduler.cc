@@ -199,6 +199,7 @@ struct QueueSample {
     Clock::time_point last_log{};
     Profile profile = Profile::Unknown;
     unsigned int high = 0, low = 0, idle = 0;
+    unsigned int large_packet_samples = 0;
     double bps = 0, pps = 0;
     bool sampled = false, paced = false, drops = false;
     bool wheel_followup = false;
@@ -224,7 +225,10 @@ SchedulerPlacement active_placement;
 std::optional<SchedulerAction> pending_action;
 struct QueueRate {
     Clock::time_point time{};
-    double bps = 0, pps = 0, irq_share = -1;
+    double irq_share = -1;
+    bool self_folded_large = false;
+    std::array<double, 10> bps_history{}, pps_history{};
+    unsigned int next = 0;
 };
 std::array<QueueRate, MAX_NIC_QUEUES> last_rates;
 std::thread sampler;
@@ -470,8 +474,8 @@ bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now)
             now - rate.time > 2 * sample_period)
             return false;
         confirmed += q != qid;
-        bps += rate.bps;
-        pps += rate.pps;
+        bps += *std::max_element(rate.bps_history.begin(), rate.bps_history.end());
+        pps += *std::max_element(rate.pps_history.begin(), rate.pps_history.end());
     }
     const auto probe_room = [&] {
         if (!settings().probe_enabled)
@@ -549,7 +553,9 @@ std::optional<SchedulerAction> select_active_action(const std::vector<int> &pool
     }
     for (unsigned qid = 0; qid < registrations.size(); ++qid) {
         const auto &q = registrations[qid];
-        const bool heavy_shared = movable_irq(qid) && cores[q.irq_cpu].app && last_profiles[qid] == Profile::Heavy;
+        const bool busy_queue = last_profiles[qid] == Profile::Heavy ||
+                                (last_profiles[qid] != Profile::Unknown && last_rates[qid].self_folded_large);
+        const bool heavy_shared = movable_irq(qid) && cores[q.irq_cpu].app && busy_queue;
         if (!heavy_shared) {
             degraded_owner[qid] = 0;
             continue;
@@ -769,6 +775,11 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             progress[qid].known = app.irq_handoff || !high_progress;
             state.bps = 0.6 * state.bps + 0.4 * (bytes * 8.0 * hz);
             state.pps = 0.6 * state.pps + 0.4 * (packets * hz);
+            if (settings().active && app.slo == AUTO && app.single_worker_queue && app.app_cpu == app.irq_cpu &&
+                state.bps >= limits.b_low && packets && bytes / packets >= 512)
+                state.large_packet_samples = std::min(state.large_packet_samples + 1, 2U);
+            else
+                state.large_packet_samples = 0;
             state.paced = (current.tw_enq_attempts - state.napi.tw_enq_attempts) * hz > 1000 ||
                           (wheel.tw_sent_pkts - state.wheel.tw_sent_pkts) * hz > 1000;
             state.drops = wheel.tw_drop_pkts != state.wheel.tw_drop_pkts;
@@ -850,8 +861,16 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                                          ? state.profile : Profile::Unknown;
                     if (settings().active) {
                         const auto &cpu = cores[snapshot[qid].irq_cpu];
-                        last_rates[qid] = {state.sampled ? now : Clock::time_point{}, state.bps, state.pps,
-                                          cpu.valid_probe ? cpu.rx + cpu.tx : -1};
+                        auto &rate = last_rates[qid];
+                        if (rate.time == Clock::time_point{} || now - rate.time > 2 * sample_period)
+                            rate = {};
+                        rate.time = state.sampled ? now : Clock::time_point{};
+                        rate.irq_share = cpu.valid_probe ? cpu.rx + cpu.tx : -1;
+                        rate.self_folded_large = state.large_packet_samples >= 2;
+                        // Keep a half second of demand evidence across short incumbent troughs.
+                        rate.bps_history[rate.next] = state.bps;
+                        rate.pps_history[rate.next] = state.pps;
+                        rate.next = (rate.next + 1) % rate.bps_history.size();
                     }
                     if (settings().manual || settings().active) {
                         auto &irq = last_irq_progress[qid];

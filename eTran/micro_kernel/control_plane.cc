@@ -1254,9 +1254,11 @@ public:
             ++resource_epoch;
             irq_cooldown[move.qid] = {move.app->generation, Clock::now() + std::chrono::milliseconds(200)};
         }
-        fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld\n",
+        const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+        fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld mono_us=%lld\n",
                 move.qid, target, rollback, static_cast<unsigned long long>(current.done - move.base.done),
-                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
+                static_cast<long long>(mono_us));
         scheduler_track_irq_handoff(move.qid, false);
         irq_action.reset();
     }
@@ -1290,9 +1292,11 @@ public:
                 release_cpu(*move.app, CpuRole::App, move.src);
                 ++resource_epoch;
             }
-            fprintf(stderr, "sched_migration state=CONFIRM pid=%d slot=%u seq=%u cpu=%d rollback=%d elapsed_us=%lld\n",
+            const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
+            fprintf(stderr, "sched_migration state=CONFIRM pid=%d slot=%u seq=%u cpu=%d rollback=%d elapsed_us=%lld mono_us=%lld\n",
                     move.app->pid, move.slot, move.seq, target, rolling_back,
-                    static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+                    static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
+                    static_cast<long long>(mono_us));
             action.reset();
             return;
         }
