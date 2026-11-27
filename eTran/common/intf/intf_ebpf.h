@@ -30,13 +30,16 @@
 
 #define MAX_TCP_FLOWS 65536
 
+#define QID_COUNTER_BYTE_BITS 37
+#define QID_COUNTER_PACKET (1ULL << QID_COUNTER_BYTE_BITS)
+#define QID_COUNTER_BYTE_MASK (QID_COUNTER_PACKET - 1)
+
 struct bpf_qid_napi_stats {
-    __u64 rx_xsk_pkts;
-    __u64 rx_xsk_bytes;
-    __u64 tx_direct_pkts;
-    __u64 tx_direct_bytes;
+    // Each update adds one packet unit plus length. Decode the delta, not the absolute word.
+    __u64 rx_xsk;
+    __u64 tx_direct;
     __u64 tw_enq_attempts;
-    __u64 pad[3];
+    __u64 pad[5];
 } __attribute__((aligned(64)));
 
 struct bpf_qid_tw_stats {

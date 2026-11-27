@@ -161,6 +161,7 @@ struct QueueSample {
     uint64_t generation = 0;
     bpf_qid_napi_stats napi{};
     bpf_qid_tw_stats wheel{};
+    uint64_t rx_packets = 0, direct_packets = 0;
     Clock::time_point since{};
     Clock::time_point last{};
     Clock::time_point last_log{};
@@ -279,10 +280,8 @@ public:
             return fallback[qid];
         const auto &row = (*mapped)[qid];
         bpf_qid_napi_stats sample{};
-        sample.rx_xsk_pkts = __atomic_load_n(&row.rx_xsk_pkts, __ATOMIC_RELAXED);
-        sample.rx_xsk_bytes = __atomic_load_n(&row.rx_xsk_bytes, __ATOMIC_RELAXED);
-        sample.tx_direct_pkts = __atomic_load_n(&row.tx_direct_pkts, __ATOMIC_RELAXED);
-        sample.tx_direct_bytes = __atomic_load_n(&row.tx_direct_bytes, __ATOMIC_RELAXED);
+        sample.rx_xsk = __atomic_load_n(&row.rx_xsk, __ATOMIC_RELAXED);
+        sample.tx_direct = __atomic_load_n(&row.tx_direct, __ATOMIC_RELAXED);
         sample.tw_enq_attempts = __atomic_load_n(&row.tw_enq_attempts, __ATOMIC_RELAXED);
         return sample;
     }
@@ -498,7 +497,10 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             if (!app.pid)
                 continue;
             const auto current = have_napi ? napi.read(qid) : bpf_qid_napi_stats{};
-            const bool first = state.generation != app.generation || state.last == Clock::time_point{};
+            // A delayed sampler must not treat ambiguous packed deltas as measured rates.
+            // A second is shorter than either field's wrap horizon on the supported NICs.
+            const bool first = state.generation != app.generation || state.last == Clock::time_point{} ||
+                               now - state.last > std::chrono::seconds(1);
             const bool enqueued = current.tw_enq_attempts != state.napi.tw_enq_attempts;
             const bool read_wheel = first || enqueued || state.paced || state.wheel_followup ||
                                     !have_pending || pending[app.irq_cpu] != 0;
@@ -519,12 +521,15 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             }
 
             const double hz = 1.0 / std::chrono::duration<double>(now - state.last).count();
-            const auto bytes = current.rx_xsk_bytes - state.napi.rx_xsk_bytes +
-                               current.tx_direct_bytes - state.napi.tx_direct_bytes +
+            const auto rx = current.rx_xsk - state.napi.rx_xsk;
+            const auto tx = current.tx_direct - state.napi.tx_direct;
+            const auto bytes = (rx & QID_COUNTER_BYTE_MASK) + (tx & QID_COUNTER_BYTE_MASK) +
                                wheel.tw_sent_bytes - state.wheel.tw_sent_bytes;
-            const auto packets = current.rx_xsk_pkts - state.napi.rx_xsk_pkts +
-                                 current.tx_direct_pkts - state.napi.tx_direct_pkts +
-                                 wheel.tw_sent_pkts - state.wheel.tw_sent_pkts;
+            const auto rx_packets = rx >> QID_COUNTER_BYTE_BITS;
+            const auto direct_packets = tx >> QID_COUNTER_BYTE_BITS;
+            const auto packets = rx_packets + direct_packets + wheel.tw_sent_pkts - state.wheel.tw_sent_pkts;
+            state.rx_packets += rx_packets;
+            state.direct_packets += direct_packets;
             const bool high_progress = bytes * 8.0 * hz >= limits.b_high ||
                                        packets * hz >= limits.p_high;
             progress[qid].known = app.irq_handoff || !high_progress;
@@ -592,7 +597,8 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                         state.bps, state.pps, state.paced, valid_probe ? core.rx : -1,
                         valid_probe ? core.tx : -1, valid_probe ? share : -1, state.wait_ratio,
                         state.tid, progress[qid].inflight, progress[qid].stalled,
-                        state.napi.rx_xsk_pkts, state.napi.tx_direct_pkts, state.napi.tw_enq_attempts,
+                        static_cast<unsigned long long>(state.rx_packets),
+                        static_cast<unsigned long long>(state.direct_packets), state.napi.tw_enq_attempts,
                         state.wheel.tw_sent_pkts, state.wheel.tw_drop_pkts);
                 state.last_log = now;
             }
@@ -610,7 +616,7 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                                          ? state.profile : Profile::Unknown;
                     if (settings().manual) {
                         auto &irq = last_irq_progress[qid];
-                        const auto packets = state.napi.rx_xsk_pkts + state.napi.tx_direct_pkts +
+                        const auto packets = state.rx_packets + state.direct_packets +
                                              state.wheel.tw_sent_pkts;
                         irq.no_backlog = state.sampled && (cores[snapshot[qid].irq_cpu].valid_probe ||
                                          (have_counts && counts_baseline)) &&
