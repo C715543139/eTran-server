@@ -466,7 +466,7 @@ bool light_queue(Profile profile)
     return profile == Profile::Light || profile == Profile::Idle;
 }
 
-bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now)
+bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now, bool report = false)
 {
     const auto &source = registrations[qid];
     const auto &target = active_placement.cores[cpu];
@@ -501,7 +501,10 @@ bool can_merge_irq(unsigned int qid, int cpu, Clock::time_point now)
         const auto a = last_rates[qid].irq_share, b = last_rates[other - registrations.begin()].irq_share;
         return a >= 0 && b >= 0 && a + b <= .85;
     };
-    return confirmed == target.irq && bps <= active_limits.bps && pps <= active_limits.pps && probe_room();
+    const bool allowed = confirmed == target.irq && bps <= active_limits.bps && pps <= active_limits.pps && probe_room();
+    if (allowed && report && settings().verbose)
+        fprintf(stderr, "sched_merge_capacity qid=%u dst=%d bps=%.0f pps=%.0f\n", qid, cpu, bps, pps);
+    return allowed;
 }
 
 std::optional<SchedulerAction> select_active_action(const std::vector<int> &pool, Clock::time_point now)
@@ -945,7 +948,29 @@ std::optional<SchedulerAction> scheduler_exchange_placement(const SchedulerPlace
 bool scheduler_can_merge_irq(unsigned int qid, int cpu)
 {
     std::lock_guard<std::mutex> lock(registration_mutex);
-    return can_merge_irq(qid, cpu, Clock::now());
+    return can_merge_irq(qid, cpu, Clock::now(), true);
+}
+
+void scheduler_snapshot_incumbent_rates(unsigned int qid)
+{
+    if (!settings().active)
+        return;
+    std::lock_guard<std::mutex> lock(registration_mutex);
+    // Capture before RSS/XSK setup can reduce the incumbent's observed progress.
+    auto &rates = admission_rates[qid];
+    rates.fill({});
+    const auto now = Clock::now();
+    for (unsigned other = 0; other < registrations.size(); ++other) {
+        const auto &incumbent = registrations[other];
+        const auto &rate = last_rates[other];
+        if (other == qid || !incumbent.pid || incumbent.slo == LATENCY ||
+            light_queue(last_profiles[other]) || now - rate.time > 4 * sample_period)
+            continue;
+        rates[other] = {incumbent.generation, rate.peak_bps(), rate.peak_pps()};
+        if (settings().verbose)
+            fprintf(stderr, "sched_merge_incumbent qid=%u incumbent_qid=%u bps=%.0f pps=%.0f\n",
+                    qid, other, rates[other].bps, rates[other].pps);
+    }
 }
 
 bool scheduler_request_admission_fold()
@@ -1015,19 +1040,6 @@ void scheduler_register_queue(unsigned int qid, int pid, int slo, int irq_cpu, i
     last_profiles[qid] = Profile::Unknown;
     last_irq_progress[qid] = {};
     last_rates[qid] = {};
-    if (settings().active) {
-        // A contending newcomer can depress an incumbent's measured rate for its entire warmup.
-        auto &rates = admission_rates[qid];
-        rates.fill({});
-        const auto now = Clock::now();
-        for (unsigned other = 0; other < registrations.size(); ++other) {
-            const auto &incumbent = registrations[other];
-            const auto &rate = last_rates[other];
-            if (other != qid && incumbent.pid && last_profiles[other] == Profile::Heavy &&
-                now - rate.time <= 2 * sample_period)
-                rates[other] = {incumbent.generation, rate.peak_bps(), rate.peak_pps()};
-        }
-    }
 }
 
 void scheduler_unregister_queue(unsigned int qid)

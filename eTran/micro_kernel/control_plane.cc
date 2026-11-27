@@ -2487,8 +2487,10 @@ static int alloc_app_resources(struct register_request &req, int fd, int request
         job.prepare = PrepRequest{actx->pid, actx->nr_app_threads, etran_nic->_socket_busy_poll};
 #ifdef ALLOCATION
         auto cpu = actx->usedCores.begin();
-        for (auto qid : qids)
+        for (auto qid : qids) {
+            scheduler_snapshot_incumbent_rates(qid);
             job.placement.emplace_back(qid, *cpu++);
+        }
 #else
         for (auto qid : qids)
             job.placement.emplace_back(qid, -1);

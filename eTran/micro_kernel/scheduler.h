@@ -41,6 +41,7 @@ struct SchedulerAction {
 std::optional<SchedulerAction> scheduler_exchange_placement(const SchedulerPlacement &placement);
 bool scheduler_can_merge_irq(unsigned int qid, int cpu);
 bool scheduler_request_admission_fold();
+void scheduler_snapshot_incumbent_rates(unsigned int qid);
 int start_scheduler(const CpuTopology &topology, unsigned int queues, int napi_fd, int tw_fd,
                     int tw_pending_fd, const bpf_cc_map_user *cc);
 void stop_scheduler();
