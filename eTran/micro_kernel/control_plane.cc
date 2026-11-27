@@ -198,6 +198,7 @@ static_assert(sizeof(head_wb) == 64 && sizeof(lrpc_msg) == 64, "scheduler contro
 
 struct ManagedTcpResources {
     buffer_pool_wrapper bpw{};
+    xsk_umem *umem = nullptr;
     int umem_id = -1;
     int rss_context = 0;
     std::vector<xsk_socket_info *> controls;
@@ -1474,10 +1475,10 @@ static int dispose_managed_tcp(ManagedTcpResources &res)
     for (int fd : res.data_fds)
         close(fd);
     res.data_fds.clear();
-    if (res.bpw.bp && res.bpw.bp->umem) {
-        if (const int error = xsk_umem__delete(res.bpw.bp->umem))
+    if (res.umem) {
+        if (const int error = xsk_umem__delete(res.umem))
             return error;
-        res.bpw.bp->umem = nullptr;
+        res.umem = nullptr;
     }
     bp_free(&res.bpw);
     res.bpw = {};
@@ -1495,6 +1496,7 @@ static int prepare_managed_tcp(const RssJob &job, ManagedTcpResources &res)
     const auto &prep = *job.prepare;
     if (bp_init(&res.bpw, prep.pid, SHM_BP_PREFIX, SHM_UMEM_PREFIX))
         return -ENOMEM;
+    res.umem = res.bpw.bp->umem;
     for (const auto &[qid, cpu] : job.placement) {
         auto *xsk = xsk_configure_socket_for_queue(&res.bpw, qid, IPPROTO_TCP);
         if (!xsk)
@@ -1757,6 +1759,7 @@ static void retire_managed_tcp(app_ctx &app)
         epoll_ctl(xsk_epfd, EPOLL_CTL_DEL, fd, nullptr);
         unregister_xsk_map(fd, queue.xsk_map_key, app.proto);
         unregister_slow_path_map(qid, app.proto);
+        resources->umem = xsk->umem;
         resources->controls.push_back(xsk);
         queue.xsk_info = nullptr;
         queue.bpw = nullptr;
