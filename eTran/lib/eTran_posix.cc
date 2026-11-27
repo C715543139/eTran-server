@@ -658,21 +658,11 @@ int tcp_nic_poll_epoll(struct app_ctx_per_thread *tctx, struct eTrantcp_event *r
     }
 
     nr_event += process_tcp_kernel_events(tctx, ret_events + nr_event, budget - nr_event);
-    auto *ctrl = tctx->sched_ctrl;
-    const bool marked_sleeping = ctrl && !nr_event && timeout != 0;
-    if (marked_sleeping) {
-        __atomic_store_n(&ctrl->state_flags, WORKER_FLAG_SLEEPING, __ATOMIC_SEQ_CST);
-        if (apply_worker_sched_command<__ATOMIC_SEQ_CST>(tctx))
-            timeout = 0;
-    } else {
-        timeout = 0;
-    }
+    timeout = 0;
 
     // step2: receive packets (<= budget) from **all** NIC queues in a deficit round-robin manner
     nfds = libc_epoll_wait(tctx->epfd, events, nr_nic_queues + 1, timeout);
-    if (marked_sleeping)
-        __atomic_store_n(&ctrl->state_flags, 0, __ATOMIC_SEQ_CST);
-    if (ctrl)
+    if (unlikely(tctx->sched_ctrl != nullptr))
         apply_worker_sched_command(tctx);
     if (unlikely(nfds < 0))
     {
