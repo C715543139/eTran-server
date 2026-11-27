@@ -1,8 +1,8 @@
 # Compile eBPF code with the makefile from bpf-examples
 eBPF_DIR	:= ./
 
-BPF_TARGETS	:= $(eBPF_DIR)/main
-BPF_HEADERS	:= $(wildcard $(eBPF_DIR)/*.h) ../../../common/intf/intf_ebpf.h ../../../common/intf/capacity.h ../../../common/tran_def/tcp.h ../*.h
+BPF_TARGETS	:= $(eBPF_DIR)/main $(eBPF_DIR)/counted
+BPF_HEADERS	:= $(wildcard $(eBPF_DIR)/*.h) ../../../common/intf/intf_ebpf.h ../../../common/intf/capacity.h ../../../common/tran_def/tcp.h ../*.h main.c
 
 BPF_CFLAGS := -Wno-address-of-packed-member -I../../../intf -I../../../common/
 

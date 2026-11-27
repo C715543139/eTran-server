@@ -122,20 +122,14 @@ int eTranTCP::load_ebpf_programs(void)
     int err = 0;
     struct bpf_object *obj;
 
-    obj = bpf_object__open_file(TCP_BPF_OBJ_PATH.c_str(), nullptr);
+    const bool count_queues = scheduler_collect_qid_stats();
+    const char *object_path = count_queues ? "eBPF/tcp/counted.o" : TCP_BPF_OBJ_PATH.c_str();
+    obj = bpf_object__open_file(object_path, nullptr);
     err = libbpf_get_error(obj);
     if (err)
     {
         fprintf(stderr, "ERROR: opening BPF object file failed (%d): %s\n", err, strerror(-err));
         return err;
-    }
-
-    const __u32 stats_enabled = scheduler_collect_qid_stats();
-    auto *settings = bpf_object__find_map_by_name(obj, ".rodata.qid_stats_enabled");
-    if (!settings || bpf_map__set_initial_value(settings, &stats_enabled, sizeof(stats_enabled))) {
-        fprintf(stderr, "ERROR: cannot configure TCP per-QID counters\n");
-        bpf_object__close(obj);
-        return -EINVAL;
     }
 
     struct bpf_map *prev_conn = bpf_object__find_map_by_name(obj, ".data.prev_conn");
@@ -211,7 +205,7 @@ int eTranTCP::load_ebpf_programs(void)
 
     _ebpf.xdp_gen_fd = err;
 
-    _ebpf.xdp_prog = xdp_program__open_file(TCP_BPF_OBJ_PATH.c_str(), "xdp_sock", nullptr);
+    _ebpf.xdp_prog = xdp_program__open_file(object_path, "xdp_sock", nullptr);
     err = libxdp_get_error(_ebpf.xdp_prog);
     if (err)
     {
