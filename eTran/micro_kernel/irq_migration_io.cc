@@ -6,6 +6,7 @@
 #include <charconv>
 #include <cstring>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -104,10 +105,63 @@ struct ChannelStats {
     }
 };
 
+bool read_irq_cpu_counts(int irq, int source_cpu, int target_cpu,
+                         uint64_t &source_count, uint64_t &target_count)
+{
+    if (irq < 0 || source_cpu < 0 || target_cpu < 0)
+        return false;
+    std::ifstream interrupts("/proc/interrupts");
+    std::string line, token;
+    if (!std::getline(interrupts, line))
+        return false;
+
+    std::istringstream header(line);
+    std::vector<int> columns;
+    while (header >> token) {
+        if (token.compare(0, 3, "CPU") != 0)
+            continue;
+        int cpu = -1;
+        const auto start = token.data() + 3;
+        const auto end = token.data() + token.size();
+        const auto parsed = std::from_chars(start, end, cpu);
+        if (parsed.ec != std::errc{} || parsed.ptr != end || cpu < 0)
+            return false;
+        columns.push_back(cpu);
+    }
+    if (columns.empty())
+        return false;
+
+    const std::string target_label = std::to_string(irq) + ':';
+    while (std::getline(interrupts, line)) {
+        std::istringstream row(line);
+        if (!(row >> token) || token != target_label)
+            continue;
+        bool found_source = false;
+        bool found_target = false;
+        for (int cpu : columns) {
+            uint64_t value = 0;
+            if (!(row >> value))
+                return false;
+            if (cpu == source_cpu) {
+                source_count = value;
+                found_source = true;
+            }
+            if (cpu == target_cpu) {
+                target_count = value;
+                found_target = true;
+            }
+        }
+        return found_source && found_target;
+    }
+    return false;
+}
+
 } // namespace
 
-int sample_irq_handoff(const eTranNIC &nic, unsigned int qid, bool read_counters, IrqHandoffSample &sample)
+int sample_irq_handoff(const eTranNIC &nic, unsigned int qid, int source_cpu, int target_cpu,
+                       bool read_counters, IrqHandoffSample &sample)
 {
+    sample = {};
     const int irq = nic.get_queue_irq(qid);
     if (irq < 0)
         return irq;
@@ -123,5 +177,8 @@ int sample_irq_handoff(const eTranNIC &nic, unsigned int qid, bool read_counters
     static ChannelStats channel_stats;
     const int error = channel_stats.read(socket_fd, nic, qid, sample);
     close(socket_fd);
+    if (!error)
+        sample.have_irq_counts = read_irq_cpu_counts(irq, source_cpu, target_cpu,
+                                                     sample.source_irqs, sample.target_irqs);
     return error;
 }

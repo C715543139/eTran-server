@@ -181,6 +181,7 @@ static int poll_network(int timeout_ms);
 struct IrqWork {
     uint64_t token;
     unsigned int qid;
+    int source;
     int target;
     int expected_source;
     bool write;
@@ -1010,6 +1011,8 @@ class MigrationExecutor {
         bool pending_io = false;
         bool cancelled = false;
         bool initially_idle = false;
+        bool direct_seen = false;
+        uint64_t direct_src_irqs = 0;
         IrqHandoffSample base{};
         IrqHandoffSample last{};
         Clock::time_point began{}, next_sample{};
@@ -1056,11 +1059,12 @@ class MigrationExecutor {
     static void send_irq_io(IrqMove &move, bool write)
     {
         const bool rollback = move.state == State::RollingBack;
+        const int source = rollback ? move.dst : move.src;
         const int target = rollback ? move.src : move.dst;
         const int expected = write && !rollback ? move.src : -1;
         move.pending_io = true;
         submit_rss_job({move.app->generation, {},
-                        IrqWork{move.token, move.qid, target, expected, write, !move.initially_idle}});
+                        IrqWork{move.token, move.qid, source, target, expected, write, !move.initially_idle}});
     }
 
     void begin_irq(IrqMove &move, State state)
@@ -1070,6 +1074,8 @@ class MigrationExecutor {
         move.state = state;
         move.began = Clock::now();
         move.initially_idle = scheduler_irq_progress(move.qid, move.src, move.dst).idle;
+        move.direct_seen = false;
+        move.direct_src_irqs = 0;
         fprintf(stderr, "sched_migration kind=IRQ state=%s app_gen=%llu qid=%u token=%llu src=%d dst=%d\n",
                 state == State::Migrating ? "MIGRATING" : "ROLLING_BACK",
                 static_cast<unsigned long long>(move.app->generation), move.qid,
@@ -1098,10 +1104,12 @@ class MigrationExecutor {
         auto &move = *irq_action;
         const auto now = Clock::now();
         if (now - move.began >= std::chrono::milliseconds(150)) {
-            fprintf(stderr, "sched_irq_timeout qid=%u rollback=%d configured=%d effective=%d done=%llu base_done=%llu timeouts=%llu base_timeouts=%llu\n",
+            fprintf(stderr, "sched_irq_timeout qid=%u rollback=%d configured=%d effective=%d done=%llu base_done=%llu timeouts=%llu base_timeouts=%llu src_irqs=%llu dst_irqs=%llu base_dst_irqs=%llu\n",
                     move.qid, move.state == State::RollingBack, move.last.configured, move.last.effective,
                     static_cast<unsigned long long>(move.last.done), static_cast<unsigned long long>(move.base.done),
-                    static_cast<unsigned long long>(move.last.timeouts), static_cast<unsigned long long>(move.base.timeouts));
+                    static_cast<unsigned long long>(move.last.timeouts), static_cast<unsigned long long>(move.base.timeouts),
+                    static_cast<unsigned long long>(move.last.source_irqs), static_cast<unsigned long long>(move.last.target_irqs),
+                    static_cast<unsigned long long>(move.base.target_irqs));
             if (move.state == State::Migrating)
                 begin_irq(move, State::RollingBack);
             else
@@ -1247,11 +1255,25 @@ public:
                 begin_irq(move, State::RollingBack);
             return;
         }
-        if (current.configured != target || current.effective != target)
+        if (current.configured != target || current.effective != target) {
+            move.direct_seen = false;
             return;
+        }
+        bool direct_confirmed = false;
+        if (move.base.have_irq_counts && current.have_irq_counts &&
+            current.target_irqs > move.base.target_irqs) {
+            if (move.direct_seen && current.source_irqs == move.direct_src_irqs) {
+                direct_confirmed = true;
+            } else {
+                move.direct_seen = true;
+                move.direct_src_irqs = current.source_irqs;
+            }
+        } else {
+            move.direct_seen = false;
+        }
         const auto elapsed = Clock::now() - move.began;
         const auto progress = scheduler_irq_progress(move.qid, move.src, move.dst);
-        if (!(current.done > move.base.done || (move.initially_idle && progress.idle) ||
+        if (!(current.done > move.base.done || direct_confirmed || (move.initially_idle && progress.idle) ||
               (elapsed >= std::chrono::milliseconds(100) && progress.quiet)))
             return;
 
@@ -1266,10 +1288,15 @@ public:
             irq_cooldown[move.qid] = {move.app->generation, Clock::now() + std::chrono::milliseconds(200)};
         }
         const auto mono_us = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count();
-        fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld mono_us=%lld\n",
+        const uint64_t target_irq_delta = (move.base.have_irq_counts && current.have_irq_counts &&
+                                           current.target_irqs >= move.base.target_irqs)
+                                              ? (current.target_irqs - move.base.target_irqs)
+                                              : 0;
+        fprintf(stderr, "sched_migration kind=IRQ state=CONFIRM qid=%u cpu=%d rollback=%d done_delta=%llu elapsed_us=%lld mono_us=%lld direct_irq=%d target_irq_delta=%llu\n",
                 move.qid, target, rollback, static_cast<unsigned long long>(current.done - move.base.done),
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()),
-                static_cast<long long>(mono_us));
+                static_cast<long long>(mono_us), direct_confirmed ? 1 : 0,
+                static_cast<unsigned long long>(target_irq_delta));
         scheduler_track_irq_handoff(move.qid, false);
         irq_action.reset();
     }
@@ -1664,7 +1691,7 @@ static RssResult execute_rss_job(RssJob job)
         const auto &op = *job.irq;
         result.irq = IrqResult{op, {}};
         auto &io = *result.irq;
-        result.error = sample_irq_handoff(*etran_nic, op.qid, op.read_counters, io.sample);
+        result.error = sample_irq_handoff(*etran_nic, op.qid, op.source, op.target, op.read_counters, io.sample);
         if (result.error || !op.write)
             return result;
         if (op.expected_source >= 0 &&
