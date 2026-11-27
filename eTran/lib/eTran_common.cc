@@ -619,12 +619,16 @@ int eTran_init(struct eTran_cfg *cfg)
         actx->nr_app_threads > MAX_APP_THREADS) {
         return -EPROTO;
     }
+    if (requested.irq_cpu >= 0)
+        for (unsigned int i = 0; i < actx->nr_nic_queues; ++i)
+            if (resp.cpus[i] != requested.irq_cpu)
+                return -EPROTO;
     cpu_set_t application_cpus;
     CPU_ZERO(&application_cpus);
     for (unsigned int i = 0; i < actx->nr_app_threads; i++) {
         int cpu = resp.cpus[actx->nr_nic_queues + i];
         if (cpu < 0 || cpu >= CPU_SETSIZE ||
-            (requested_app_cpu >= 0 && cpu != requested_app_cpu)) {
+            (requested.app_cpu >= 0 && cpu != requested.app_cpu)) {
             return -EPROTO;
         }
         tcp_state.cpus[i] = cpu;
