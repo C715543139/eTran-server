@@ -1011,6 +1011,7 @@ class MigrationExecutor {
         bool cancelled = false;
         bool initially_idle = false;
         IrqHandoffSample base{};
+        IrqHandoffSample last{};
         Clock::time_point began{}, next_sample{};
     };
     std::optional<Move> action;
@@ -1097,6 +1098,10 @@ class MigrationExecutor {
         auto &move = *irq_action;
         const auto now = Clock::now();
         if (now - move.began >= std::chrono::milliseconds(150)) {
+            fprintf(stderr, "sched_irq_timeout qid=%u rollback=%d configured=%d effective=%d done=%llu base_done=%llu timeouts=%llu base_timeouts=%llu\n",
+                    move.qid, move.state == State::RollingBack, move.last.configured, move.last.effective,
+                    static_cast<unsigned long long>(move.last.done), static_cast<unsigned long long>(move.base.done),
+                    static_cast<unsigned long long>(move.last.timeouts), static_cast<unsigned long long>(move.base.timeouts));
             if (move.state == State::Migrating)
                 begin_irq(move, State::RollingBack);
             else
@@ -1200,6 +1205,8 @@ public:
                irq_action->app->generation == result.generation);
         auto &move = *irq_action;
         move.pending_io = false;
+        if (!result.error)
+            move.last = io.sample;
         if (move.cancelled) {
             hold_irq(move, "CANCELLED_QUIESCENT");
             return;
@@ -1230,6 +1237,10 @@ public:
         const auto &current = io.sample;
         const int target = rollback ? move.src : move.dst;
         if (current.timeouts != move.base.timeouts || current.done < move.base.done) {
+            fprintf(stderr, "sched_irq_counter_change qid=%u rollback=%d done=%llu base_done=%llu timeouts=%llu base_timeouts=%llu\n",
+                    move.qid, rollback, static_cast<unsigned long long>(current.done),
+                    static_cast<unsigned long long>(move.base.done), static_cast<unsigned long long>(current.timeouts),
+                    static_cast<unsigned long long>(move.base.timeouts));
             if (rollback)
                 hold_irq(move, "QUARANTINED");
             else

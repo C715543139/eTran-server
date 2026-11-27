@@ -200,6 +200,7 @@ struct QueueSample {
     Profile profile = Profile::Unknown;
     unsigned int high = 0, low = 0, idle = 0;
     unsigned int large_packet_samples = 0;
+    unsigned int merge_progress_samples = 0;
     double bps = 0, pps = 0;
     bool sampled = false, paced = false, drops = false;
     bool wheel_followup = false;
@@ -227,6 +228,7 @@ struct QueueRate {
     Clock::time_point time{};
     double irq_share = -1;
     bool self_folded_large = false;
+    bool ready_to_merge = false;
     std::array<double, 10> bps_history{}, pps_history{};
     unsigned int next = 0;
 };
@@ -564,7 +566,7 @@ std::optional<SchedulerAction> select_active_action(const std::vector<int> &pool
         redline = true;
         if (spare >= 0)
             return irq_move(qid, spare, Reason::R1);
-        if (q.slo == LATENCY)
+        if (q.slo == LATENCY || !last_rates[qid].ready_to_merge)
             continue;
         for (int cpu : pool)
             if (can_merge_irq(qid, cpu, now))
@@ -775,6 +777,10 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
             progress[qid].known = app.irq_handoff || !high_progress;
             state.bps = 0.6 * state.bps + 0.4 * (bytes * 8.0 * hz);
             state.pps = 0.6 * state.pps + 0.4 * (packets * hz);
+            if (settings().active && (state.bps >= limits.b_low || state.pps >= limits.p_low))
+                state.merge_progress_samples = std::min(state.merge_progress_samples + 1, 8U);
+            else
+                state.merge_progress_samples = 0;
             if (settings().active && app.slo == AUTO && app.single_worker_queue && app.app_cpu == app.irq_cpu &&
                 state.bps >= limits.b_low && packets && bytes / packets >= 512)
                 state.large_packet_samples = std::min(state.large_packet_samples + 1, 2U);
@@ -867,6 +873,7 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                         rate.time = state.sampled ? now : Clock::time_point{};
                         rate.irq_share = cpu.valid_probe ? cpu.rx + cpu.tx : -1;
                         rate.self_folded_large = state.large_packet_samples >= 2;
+                        rate.ready_to_merge = state.merge_progress_samples >= 8;
                         // Keep a half second of demand evidence across short incumbent troughs.
                         rate.bps_history[rate.next] = state.bps;
                         rate.pps_history[rate.next] = state.pps;
