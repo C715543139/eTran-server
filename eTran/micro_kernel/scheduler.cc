@@ -229,7 +229,8 @@ struct QueueRate {
     double irq_share = -1;
     bool self_folded_large = false;
     bool ready_to_merge = false;
-    std::array<double, 10> bps_history{}, pps_history{};
+    // Keep the incumbent's pre-contention rate while the newcomer warms up.
+    std::array<double, 40> bps_history{}, pps_history{};
     unsigned int next = 0;
 };
 std::array<QueueRate, MAX_NIC_QUEUES> last_rates;
@@ -874,7 +875,6 @@ void sample_queues(unsigned int queues, int napi_fd, int tw_fd, int pending_fd,
                         rate.irq_share = cpu.valid_probe ? cpu.rx + cpu.tx : -1;
                         rate.self_folded_large = state.large_packet_samples >= 2;
                         rate.ready_to_merge = state.merge_progress_samples >= 8;
-                        // Keep a half second of demand evidence across short incumbent troughs.
                         rate.bps_history[rate.next] = state.bps;
                         rate.pps_history[rate.next] = state.pps;
                         rate.next = (rate.next + 1) % rate.bps_history.size();
